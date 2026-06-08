@@ -129,6 +129,17 @@ func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 		ht.Spec.Host = input.String(flagkey.HtHost)
 	}
 
+	// Handle ingressClassName separately from other ingress fields
+	if input.IsSet(flagkey.HtIngressClassName) {
+		className := input.String(flagkey.HtIngressClassName)
+		if className == "-" {
+			// User explicitly wants to remove ingressClassName
+			ht.Spec.IngressConfig.IngressClassName = nil
+		} else if className != "" {
+			ht.Spec.IngressConfig.IngressClassName = &className
+		}
+	}
+
 	if input.IsSet(flagkey.HtIngressRule) || input.IsSet(flagkey.HtIngressAnnotation) || input.IsSet(flagkey.HtIngressTLS) {
 		fallbackURL := ""
 		if ht.Spec.Prefix != nil && *ht.Spec.Prefix != "" {

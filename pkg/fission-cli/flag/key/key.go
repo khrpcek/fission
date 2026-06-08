@@ -96,6 +96,7 @@ const (
 	HtIngressRule       = "ingressrule"
 	HtIngressAnnotation = "ingressannotation"
 	HtIngressTLS        = "ingresstls"
+	HtIngressClassName  = "ingressclassname"
 	HtFnName            = "function"
 	HtFnWeight          = "weight"
 	HtFilter            = HtFnName

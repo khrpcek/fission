@@ -36,6 +36,9 @@ type IngressConfigApplyConfiguration struct {
 	// TLS key and certificate. The domain name in the
 	// key and crt must match the value of Host field.
 	TLS *string `json:"tls,omitempty"`
+	// IngressClassName is the name of the IngressClass cluster
+	// resource that should be used to implement this Ingress.
+	IngressClassName *string `json:"ingressClassName,omitempty"`
 }
 
 // IngressConfigApplyConfiguration constructs a declarative configuration of the IngressConfig type for use with
@@ -79,5 +82,13 @@ func (b *IngressConfigApplyConfiguration) WithHost(value string) *IngressConfigA
 // If called multiple times, the TLS field is set to the value of the last call.
 func (b *IngressConfigApplyConfiguration) WithTLS(value string) *IngressConfigApplyConfiguration {
 	b.TLS = &value
+	return b
+}
+
+// WithIngressClassName sets the IngressClassName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the IngressClassName field is set to the value of the last call.
+func (b *IngressConfigApplyConfiguration) WithIngressClassName(value string) *IngressConfigApplyConfiguration {
+	b.IngressClassName = &value
 	return b
 }

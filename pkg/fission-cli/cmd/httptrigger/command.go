@@ -32,7 +32,7 @@ func Commands() *cobra.Command {
 	wrapper.SetFlags(createCmd, flag.FlagSet{
 		Required: []flag.Flag{flag.HtFnName},
 		Optional: []flag.Flag{flag.HtUrl, flag.HtName, flag.HtMethod, flag.HtIngress,
-			flag.HtIngressRule, flag.HtIngressAnnotation, flag.HtIngressTLS,
+			flag.HtIngressRule, flag.HtIngressAnnotation, flag.HtIngressTLS, flag.HtIngressClassName,
 			flag.HtFnWeight, flag.HtHost, flag.NamespaceFunction, flag.SpecSave, flag.SpecDry,
 			flag.HtPrefix, flag.HtKeepPrefix},
 	})
@@ -57,7 +57,7 @@ func Commands() *cobra.Command {
 		Required: []flag.Flag{flag.HtName},
 		Optional: []flag.Flag{flag.HtUrl, flag.HtFnName,
 			flag.HtMethod, flag.HtIngress, flag.HtIngressRule, flag.HtIngressAnnotation,
-			flag.HtIngressTLS, flag.HtFnWeight, flag.HtHost, flag.NamespaceTrigger,
+			flag.HtIngressTLS, flag.HtIngressClassName, flag.HtFnWeight, flag.HtHost, flag.NamespaceTrigger,
 			flag.HtPrefix, flag.HtKeepPrefix},
 	})
 

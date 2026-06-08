@@ -152,6 +152,11 @@ spec:
                       host is empty or "*", the rule applies to all
                       inbound HTTP traffic.
                     type: string
+                  ingressClassName:
+                    description: |-
+                      IngressClassName is the name of the IngressClass cluster
+                      resource that should be used to implement this Ingress.
+                    type: string
                   path:
                     description: |-
                       Path is for path matching. The format of path

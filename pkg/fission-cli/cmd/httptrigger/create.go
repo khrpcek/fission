@@ -171,6 +171,17 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 		return fmt.Errorf("error parsing ingress configuration: %w", err)
 	}
 
+	// Set ingress class name if provided
+	if input.IsSet(flagkey.HtIngressClassName) {
+		className := input.String(flagkey.HtIngressClassName)
+		if className == "-" {
+			// User explicitly wants to remove ingressClassName
+			// Keep it as nil in the struct
+		} else if className != "" {
+			ingressConfig.IngressClassName = &className
+		}
+	}
+
 	opts.trigger = &fv1.HTTPTrigger{
 		ObjectMeta: m,
 		Spec: fv1.HTTPTriggerSpec{

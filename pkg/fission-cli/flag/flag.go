@@ -142,6 +142,7 @@ var (
 	HtIngress           = Flag{Type: Bool, Name: flagkey.HtIngress, Usage: "Creates ingress with same URL"}
 	HtIngressRule       = Flag{Type: String, Name: flagkey.HtIngressRule, Usage: "Host for Ingress rule: --ingressrule host=path (the format of host/path depends on what ingress controller you used)"}
 	HtIngressAnnotation = Flag{Type: StringSlice, Name: flagkey.HtIngressAnnotation, Usage: "Annotation for Ingress: --ingressannotation key=value (the format of annotation depends on what ingress controller you used)"}
+	HtIngressClassName  = Flag{Type: String, Name: flagkey.HtIngressClassName, Usage: "Class name for Ingress: --ingressclass name (the format of class name depends on what ingress controller you used)"}
 	HtIngressTLS        = Flag{Type: String, Name: flagkey.HtIngressTLS, Usage: "Name of the Secret contains TLS key and crt for Ingress (the usability of TLS features depends on what ingress controller you used)"}
 	HtFnName            = Flag{Type: StringSlice, Name: flagkey.HtFnName, Usage: "Name(s) of the function for this trigger. (If 2 functions are supplied with this flag, traffic gets routed to them based on weights supplied with --weight flag.)"}
 	HtFnWeight          = Flag{Type: IntSlice, Name: flagkey.HtFnWeight, Usage: "Weight for each function supplied with --function flag, in the same order. Used for canary deployment"}

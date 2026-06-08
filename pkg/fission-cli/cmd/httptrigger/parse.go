@@ -84,6 +84,21 @@ func GetIngressConfig(annotations []string, rule string, tls string,
 	return oldIngressConfig, nil
 }
 
+// GetIngressClassName returns the ingress class name based on user input.
+// Returns (value, isSet, remove) where:
+// - value is the ingress class name (or empty string if not set)
+// - isSet indicates if the user explicitly provided a value
+// - remove indicates if the user wants to remove the ingress class name (using "-")
+func GetIngressClassName(input string) (value *string, isSet bool, remove bool) {
+	if input == "-" {
+		return nil, true, true
+	}
+	if input == "" {
+		return nil, false, false
+	}
+	return &input, true, false
+}
+
 func getIngressAnnotations(annotations []string) (remove bool, anns map[string]string, err error) {
 	if len(annotations) == 0 {
 		return false, nil, nil

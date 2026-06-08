@@ -804,6 +804,11 @@ type (
 		// key and crt must match the value of Host field.
 		// +optional
 		TLS string `json:"tls"`
+
+		// IngressClassName is the name of the IngressClass cluster
+		// resource that should be used to implement this Ingress.
+		// +optional
+		IngressClassName *string `json:"ingressClassName,omitempty"`
 	}
 
 	// KubernetesWatchTriggerSpec defines spec of KuberenetesWatchTrigger

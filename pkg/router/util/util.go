@@ -67,7 +67,8 @@ func GetIngressSpec(namespace string, trigger *fv1.HTTPTrigger) *v1.Ingress {
 			Annotations: trigger.Spec.IngressConfig.Annotations,
 		},
 		Spec: v1.IngressSpec{
-			TLS: ingTLS,
+			IngressClassName: trigger.Spec.IngressConfig.IngressClassName,
+			TLS:              ingTLS,
 			Rules: []v1.IngressRule{
 				{
 					Host: host,
