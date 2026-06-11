@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package fscache
 
@@ -205,6 +193,13 @@ func (fsc *FunctionServiceCache) GetByFunction(m *metav1.ObjectMeta) (*FuncSvc, 
 	return &fsvcCopy, nil
 }
 
+// ReserveCapacity atomically checks the function's concurrency cap and
+// reserves one in-flight specialization in the pool cache (RFC-0002
+// ensureCapacity); returns a TooManyRequests ferror at the cap.
+func (fsc *FunctionServiceCache) ReserveCapacity(key crd.CacheKeyURG, concurrency int) error {
+	return fsc.connFunctionCache.ReserveCapacity(key, concurrency)
+}
+
 // GetFuncSvc gets a function service from pool cache using function key and returns number of active instances of function pod
 func (fsc *FunctionServiceCache) GetFuncSvc(ctx context.Context, m *metav1.ObjectMeta, requestsPerPod int, concurrency int) (*FuncSvc, error) {
 	key := crd.CacheKeyURGFromMeta(m)
@@ -296,7 +291,12 @@ func (fsc *FunctionServiceCache) Add(fsvc FuncSvc) (*FuncSvc, error) {
 	return nil, nil
 }
 
-// TouchByAddress makes a TOUCH request to given address.
+// TouchByAddress makes a TOUCH request to given address. Addresses unknown to
+// the byAddress cache fall back to the pool cache: poolmgr registers its
+// specialized pods only there (AddFunc), and with the RFC-0002 warm path the
+// router's batched taps are those pods' only liveness signal — without this
+// fallback every tap 404s and the idle reaper ages serving pods on their
+// specialization time.
 func (fsc *FunctionServiceCache) TouchByAddress(address string) error {
 	responseChannel := make(chan *fscResponse)
 	fsc.requestChannel <- &fscRequest{
@@ -305,7 +305,16 @@ func (fsc *FunctionServiceCache) TouchByAddress(address string) error {
 		responseChannel: responseChannel,
 	}
 	resp := <-responseChannel
-	return resp.error
+	if resp.error != nil {
+		// Only an unknown address falls through to the pool cache; any other
+		// error class must surface rather than be masked by the fallback's
+		// own not-found.
+		if !IsNotFoundError(resp.error) {
+			return resp.error
+		}
+		return fsc.connFunctionCache.TouchByAddress(address)
+	}
+	return nil
 }
 
 func (fsc *FunctionServiceCache) _touchByAddress(address string) error {
@@ -326,7 +335,7 @@ func (fsc *FunctionServiceCache) DeleteEntry(fsvc *FuncSvc) {
 	fsc.byFunction.Delete(crd.CacheKeyURFromMeta(fsvc.Function))
 	fsc.byAddress.Delete(fsvc.Address)
 	fsc.byFunctionUID.Delete(fsvc.Function.UID)
-	metrics.FuncRunningSummary.WithLabelValues(fsvc.Function.Name, fsvc.Function.Namespace).Observe(fsvc.Atime.Sub(fsvc.Ctime).Seconds())
+	metrics.FuncRunningSeconds.WithLabelValues(fsvc.Function.Name, fsvc.Function.Namespace).Observe(fsvc.Atime.Sub(fsvc.Ctime).Seconds())
 }
 
 // DeleteFunctionSvc deletes a function service at key composed of [function][address].
@@ -338,6 +347,13 @@ func (fsc *FunctionServiceCache) DeleteFunctionSvc(ctx context.Context, fsvc *Fu
 			"address", fsvc.Address,
 		)
 	}
+	// PodToFsvc and WebsocketFsvc are keyed by pod name (== fsvc.Name) and were
+	// never cleaned up, leaking one entry per specialized pod as pods churn.
+	// Both poolmgr cleanup paths (idle reaper and specialized-pod cleanup) route
+	// through here, so removing them once covers both. Delete is a no-op for
+	// executors that never populate these maps.
+	fsc.PodToFsvc.Delete(fsvc.Name)
+	fsc.WebsocketFsvc.Delete(fsvc.Name)
 }
 
 // DeleteOld deletes aged function service entries from cache.

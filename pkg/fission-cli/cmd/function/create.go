@@ -1,27 +1,17 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package function
 
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	asv2 "k8s.io/api/autoscaling/v2"
 	apiv1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -52,6 +42,51 @@ type CreateSubCommand struct {
 
 func Create(input cli.Input) error {
 	return (&CreateSubCommand{}).do(input)
+}
+
+// getStreamingConfig builds a StreamingConfig from the --streaming* flags, or
+// nil when --streaming is not set (the classic, non-streaming proxy path).
+func getStreamingConfig(input cli.Input) *fv1.StreamingConfig {
+	if !input.Bool(flagkey.FnStreaming) {
+		return nil
+	}
+	return &fv1.StreamingConfig{
+		Protocol:           fv1.StreamingProtocol(input.String(flagkey.FnStreamingProtocol)),
+		IdleTimeoutSeconds: input.Int(flagkey.FnStreamingIdleTimeout),
+		MaxDurationSeconds: input.Int(flagkey.FnStreamingMaxDuration),
+	}
+}
+
+// getToolConfig builds a ToolConfig from the --expose-as-mcp / --tool-* flags,
+// or nil when --expose-as-mcp is not set (the function is not advertised as an
+// MCP tool). It merges onto existing (the function's current Tool, or nil on
+// create), overwriting only the fields whose flag was explicitly set — so an
+// `fn update --expose-as-mcp` that omits --tool-name/--tool-input-schema keeps
+// the previously-set values instead of clearing them. The --tool-input-schema
+// flag points at a JSON Schema file whose raw contents are stored verbatim.
+func getToolConfig(input cli.Input, existing *fv1.ToolConfig) (*fv1.ToolConfig, error) {
+	if !input.Bool(flagkey.FnExposeAsMCP) {
+		return nil, nil
+	}
+	tc := &fv1.ToolConfig{}
+	if existing != nil {
+		tc = existing.DeepCopy()
+	}
+	if input.IsSet(flagkey.FnToolDescription) {
+		tc.Description = input.String(flagkey.FnToolDescription)
+	}
+	if input.IsSet(flagkey.FnToolName) {
+		tc.ToolName = input.String(flagkey.FnToolName)
+	}
+	if input.IsSet(flagkey.FnToolInputSchema) {
+		path := input.String(flagkey.FnToolInputSchema)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("reading tool input schema file %q: %w", path, err)
+		}
+		tc.InputSchema = &apiextensionsv1.JSON{Raw: raw}
+	}
+	return tc, nil
 }
 
 func (opts *CreateSubCommand) do(input cli.Input) error {
@@ -207,6 +242,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 		}
 
 		srcArchiveFiles := input.StringSlice(flagkey.PkgSrcArchive)
+		ociImage := input.String(flagkey.PkgOCI)
 		var deployArchiveFiles []string
 		noZip := false
 		code := input.String(flagkey.PkgCode)
@@ -216,9 +252,8 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 			deployArchiveFiles = append(deployArchiveFiles, input.String(flagkey.PkgCode))
 			noZip = true
 		}
-		// return error when both src & deploy archive are empty
-		if len(srcArchiveFiles) == 0 && len(deployArchiveFiles) == 0 {
-			return errors.New("need --code or --deploy or --src argument")
+		if err := _package.ValidateArchiveSources(code, srcArchiveFiles, deployArchiveFiles, ociImage); err != nil {
+			return err
 		}
 
 		buildcmd := input.String(flagkey.PkgBuildCmd)
@@ -226,72 +261,31 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 
 		// create new package in the same namespace as the function.
 		pkgMetadata, err = _package.CreatePackage(input, opts.Client(), pkgName, fnNamespace, envName,
-			srcArchiveFiles, deployArchiveFiles, buildcmd, specDir, opts.specFile, noZip, userProvidedNS)
+			srcArchiveFiles, deployArchiveFiles, buildcmd, specDir, opts.specFile, noZip, userProvidedNS, ociImage)
 		if err != nil {
 			return fmt.Errorf("error creating package: %w", err)
 		}
 	}
 
-	var secrets []fv1.SecretReference
-	var cfgmaps []fv1.ConfigMapReference
-
-	if len(secretNames) > 0 {
-		// check the referenced secret is in the same ns as the function, if not give a warning.
-		if !toSpec { // TODO: workaround in order not to block users from creating function spec, remove it.
-			for _, secretName := range secretNames {
-				err := util.SecretExists(input.Context(), &metav1.ObjectMeta{Namespace: fnNamespace, Name: secretName}, opts.Client().KubernetesClient)
-				if err != nil {
-					if k8serrors.IsNotFound(err) {
-						console.Warn(fmt.Sprintf("Secret %s not found in Namespace: %s. Secret needs to be present in the same namespace as function", secretName, fnNamespace))
-					} else {
-						return fmt.Errorf("error checking secret %s: %w", secretName, err)
-					}
-				}
-				newSecret := fv1.SecretReference{
-					Name:      secretName,
-					Namespace: fnNamespace,
-				}
-				secrets = append(secrets, newSecret)
-			}
-		} else {
-			for _, secretName := range secretNames {
-				newSecret := fv1.SecretReference{
-					Name:      secretName,
-					Namespace: userProvidedNS,
-				}
-				secrets = append(secrets, newSecret)
-			}
-		}
-
+	// Secret/configmap references point at the function namespace when creating
+	// against the cluster (and are existence-checked there), or at the
+	// user-provided namespace when writing a spec (no cluster check).
+	refNamespace := fnNamespace
+	if toSpec {
+		refNamespace = userProvidedNS
+	}
+	secrets, err := util.ResolveSecretReferences(input.Context(), opts.Client().KubernetesClient, secretNames, refNamespace, !toSpec, true)
+	if err != nil {
+		return err
+	}
+	cfgmaps, err := util.ResolveConfigMapReferences(input.Context(), opts.Client().KubernetesClient, cfgMapNames, refNamespace, !toSpec, true)
+	if err != nil {
+		return err
 	}
 
-	if len(cfgMapNames) > 0 {
-		// check the referenced cfgmap is in the same ns as the function, if not give a warning.
-		if !toSpec {
-			for _, cfgMapName := range cfgMapNames {
-				err := util.ConfigMapExists(input.Context(), &metav1.ObjectMeta{Namespace: fnNamespace, Name: cfgMapName}, opts.Client().KubernetesClient)
-				if err != nil {
-					if k8serrors.IsNotFound(err) {
-						console.Warn(fmt.Sprintf("ConfigMap %s not found in Namespace: %s. ConfigMap needs to be present in the same namespace as function", cfgMapName, fnNamespace))
-					} else {
-						return fmt.Errorf("error checking configmap %s: %w", cfgMapName, err)
-					}
-				}
-				newCfgMap := fv1.ConfigMapReference{
-					Name:      cfgMapName,
-					Namespace: fnNamespace,
-				}
-				cfgmaps = append(cfgmaps, newCfgMap)
-			}
-		} else {
-			for _, cfgMapName := range cfgMapNames {
-				newCfgMap := fv1.ConfigMapReference{
-					Name:      cfgMapName,
-					Namespace: userProvidedNS,
-				}
-				cfgmaps = append(cfgmaps, newCfgMap)
-			}
-		}
+	toolConfig, err := getToolConfig(input, nil)
+	if err != nil {
+		return err
 	}
 
 	opts.function = &fv1.Function{
@@ -306,6 +300,8 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 			InvokeStrategy:  *invokeStrategy,
 			FunctionTimeout: fnTimeout,
 			IdleTimeout:     &fnIdleTimeout,
+			Streaming:       getStreamingConfig(input),
+			Tool:            toolConfig,
 			Concurrency:     fnConcurrency,
 			RequestsPerPod:  requestsPerPod,
 			RetainPods:      retainPods,
@@ -359,18 +355,9 @@ func generatePackageName(fnName string, id string) string {
 // run write the resource to a spec file or create a fission CRD with remote fission server.
 // It also prints warning/error if necessary.
 func (opts *CreateSubCommand) run(input cli.Input) error {
-	// if we're writing a spec, don't create the function
-	// save to spec file or display the spec to console
-	if input.Bool(flagkey.SpecDry) {
-		return spec.SpecDry(*opts.function)
-	}
-
-	if input.Bool(flagkey.SpecSave) {
-		err := spec.SpecSave(*opts.function, opts.specFile, false)
-		if err != nil {
-			return fmt.Errorf("error saving function spec: %w", err)
-		}
-		return nil
+	// if we're writing a spec, don't create the function; save/print and return.
+	if handled, err := spec.SaveOrDry(input, *opts.function, opts.specFile); handled {
+		return err
 	}
 
 	_, err := opts.Client().FissionClientSet.CoreV1().Functions(opts.function.ObjectMeta.Namespace).Create(input.Context(), opts.function, metav1.CreateOptions{})

@@ -16,12 +16,13 @@ rules:
   - delete
 - apiGroups:
   - fission.io
-  # Packages have no status subresource — main-resource update
-  # covers their writes. functions/status is needed because the
-  # buildermgr propagates package build outcome onto dependent
-  # functions via markFunctionsForPackage.
+  # packages/status: the buildermgr writes the package BuildStatus and
+  # build conditions through the /status subresource. functions/status is
+  # needed because the buildermgr propagates package build outcome onto
+  # dependent functions via markFunctionsForPackage.
   resources:
   - functions/status
+  - packages/status
   verbs:
   - get
   - update
@@ -75,6 +76,29 @@ rules:
   - fission.io
   resources:
   - kuberneteswatchtriggers/status
+  verbs:
+  - get
+  - update
+  - patch
+{{- end }}
+
+{{- define "mcp-rules" }}
+rules:
+# The MCP server is read-only against Functions (it watches them to build the
+# tool list) and writes only the ToolExposed status condition. It never mutates
+# function specs and touches no other resource.
+- apiGroups:
+  - fission.io
+  resources:
+  - functions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - fission.io
+  resources:
+  - functions/status
   verbs:
   - get
   - update
@@ -222,4 +246,15 @@ rules:
   - watch
   - get
   - update
+# canaryconfigs/status is a separate RBAC resource once the CanaryConfig
+# /status subresource exists; the reconciler writes the rollout's terminal
+# status (succeeded/failed) and the Progressing/Ready conditions through it.
+- apiGroups:
+  - fission.io
+  resources:
+  - canaryconfigs/status
+  verbs:
+  - get
+  - update
+  - patch
 {{- end }}

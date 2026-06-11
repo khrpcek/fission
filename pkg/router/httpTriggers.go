@@ -1,37 +1,27 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package router
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bep/debounce"
 	"github.com/go-logr/logr"
 	"github.com/gorilla/mux"
+	"golang.org/x/sync/errgroup"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	k8sCache "k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/conditions"
@@ -43,13 +33,11 @@ import (
 	"github.com/fission/fission/pkg/throttler"
 	"github.com/fission/fission/pkg/utils"
 	"github.com/fission/fission/pkg/utils/httpsecurity"
-	"github.com/fission/fission/pkg/utils/manager"
 	"github.com/fission/fission/pkg/utils/metrics"
 )
 
 // HTTPTriggerSet represents an HTTP trigger set
 type HTTPTriggerSet struct {
-	*functionServiceMap
 	*mutableRouter
 
 	// internalMutableRouter is the mutable wrapper for the internal listener.
@@ -58,51 +46,69 @@ type HTTPTriggerSet struct {
 	// that only construct the public mux directly.
 	internalMutableRouter *mutableRouter
 
-	logger                     logr.Logger
-	fissionClient              versioned.Interface
-	kubeClient                 kubernetes.Interface
-	executor                   eclient.ClientInterface
-	resolver                   *functionReferenceResolver
+	logger        logr.Logger
+	fissionClient versioned.Interface
+	kubeClient    kubernetes.Interface
+	// client is the Manager's cache-backed client. The trigger/function
+	// reconcilers and updateRouter read HTTPTriggers + Functions through it,
+	// replacing the per-namespace SharedIndexInformers the router used before
+	// the controller-runtime migration.
+	client   client.Client
+	resolver *functionReferenceResolver
+	// addressResolver and tapper are the proxy path's injected seams
+	// (RFC-0002): function→address resolution and tap/untap accounting. The
+	// executor client, address cache, and throttler live inside them —
+	// deliberately NOT also retained on this struct, so there is exactly one
+	// live copy of that state.
+	addressResolver            AddressResolver
+	tapper                     Tapper
 	triggers                   []fv1.HTTPTrigger
-	triggerInformer            map[string]k8sCache.SharedIndexInformer
 	functions                  []fv1.Function
-	funcInformer               map[string]k8sCache.SharedIndexInformer
 	updateRouterRequestChannel chan struct{}
 	tsRoundTripperParams       *tsRoundTripperParams
 	isDebugEnv                 bool
 	useEncodedPath             bool
-	svcAddrUpdateThrottler     *throttler.Throttler
-	unTapServiceTimeout        time.Duration
 	syncDebouncer              func(func())
+	// ready flips true after the first successful mux build; routerReadinessHandler
+	// gates /readyz on it so a starting/rolling pod stays out of the
+	// Service endpoints until its mux is populated.
+	ready atomic.Bool
 }
 
+// makeHTTPTriggerSet builds the trigger set. cl is the Manager's cache-backed
+// client (mgr.GetClient()); it backs both the trigger/function reconcilers and
+// the resolver. A nil cl is the unit-test path that drives buildMuxes directly
+// without a Manager.
 func makeHTTPTriggerSet(logger logr.Logger, fmap *functionServiceMap, fissionClient versioned.Interface,
-	kubeClient kubernetes.Interface, executor eclient.ClientInterface, params *tsRoundTripperParams, isDebugEnv bool, useEncodedPath bool, unTapServiceTimeout time.Duration, actionThrottler *throttler.Throttler) (*HTTPTriggerSet, error) {
+	kubeClient kubernetes.Interface, cl client.Client, executor eclient.ClientInterface, params *tsRoundTripperParams, isDebugEnv bool, useEncodedPath bool, unTapServiceTimeout time.Duration, actionThrottler *throttler.Throttler) (*HTTPTriggerSet, error) {
 
 	httpTriggerSet := &HTTPTriggerSet{
 		logger:                     logger.WithName("http_trigger_set"),
-		functionServiceMap:         fmap,
 		triggers:                   []fv1.HTTPTrigger{},
 		fissionClient:              fissionClient,
 		kubeClient:                 kubeClient,
-		executor:                   executor,
+		client:                     cl,
 		updateRouterRequestChannel: make(chan struct{}, 10), // use buffer channel
 		tsRoundTripperParams:       params,
 		isDebugEnv:                 isDebugEnv,
 		useEncodedPath:             useEncodedPath,
-		svcAddrUpdateThrottler:     actionThrottler,
-		unTapServiceTimeout:        unTapServiceTimeout,
 		syncDebouncer:              debounce.New(time.Millisecond * 20),
 	}
-	httpTriggerSet.triggerInformer = utils.GetInformersForNamespaces(fissionClient, time.Minute*30, fv1.HttpTriggerResource)
-	httpTriggerSet.funcInformer = utils.GetInformersForNamespaces(fissionClient, time.Minute*30, fv1.FunctionResource)
-	err := httpTriggerSet.addTriggerHandlers()
-	if err != nil {
-		return nil, err
+	httpTriggerSet.resolver = makeFunctionReferenceResolver(logger, cl)
+	// The address resolver and tapper are the proxy path's injected seams
+	// (RFC-0002). Start (router.go) swaps addressResolver for the slice-fed
+	// fallback resolver before the first mux build when the cache mode is on.
+	httpTriggerSet.addressResolver = &executorResolver{
+		logger:    logger.WithName("executor_resolver"),
+		fmap:      fmap,
+		reader:    cl,
+		executor:  executor,
+		throttler: actionThrottler,
 	}
-	err = httpTriggerSet.addFunctionHandlers()
-	if err != nil {
-		return nil, err
+	httpTriggerSet.tapper = &executorTapper{
+		logger:       logger.WithName("tapper"),
+		executor:     executor,
+		unTapTimeout: unTapServiceTimeout,
 	}
 	return httpTriggerSet, nil
 }
@@ -110,15 +116,13 @@ func makeHTTPTriggerSet(logger logr.Logger, fmap *functionServiceMap, fissionCli
 // subscribeRouter wires the public mutable router and (optionally) the
 // internal mutable router. Passing internalMR=nil preserves the legacy
 // single-listener path used by older test scaffolding.
-func (ts *HTTPTriggerSet) subscribeRouter(ctx context.Context, mgr manager.Interface, mr *mutableRouter, internalMR *mutableRouter) error {
-	resolver := makeFunctionReferenceResolver(ts.logger, ts.funcInformer)
-	ts.resolver = resolver
+func (ts *HTTPTriggerSet) subscribeRouter(ctx context.Context, mgr *errgroup.Group, mr *mutableRouter, internalMR *mutableRouter) error {
 	ts.mutableRouter = mr
 	ts.internalMutableRouter = internalMR
 
 	if ts.fissionClient == nil {
 		// Used in tests only.
-		public, internal, err := ts.buildMuxes(nil)
+		public, internal, err := ts.buildMuxes(ctx, nil)
 		if err != nil {
 			return err
 		}
@@ -129,12 +133,14 @@ func (ts *HTTPTriggerSet) subscribeRouter(ctx context.Context, mgr manager.Inter
 		ts.logger.Info("skipping continuous trigger updates")
 		return nil
 	}
-	mgr.Add(ctx, func(ctx context.Context) {
+	// The trigger/function reconcilers (registered on the Manager) signal mux
+	// rebuilds through updateRouterRequestChannel; this goroutine consumes them.
+	// The Manager owns the informer caches, so there are no informers to Run
+	// here. The initial mux build is kicked off by Start once the cache syncs.
+	mgr.Go(func() error {
 		ts.updateRouter(ctx)
+		return nil
 	})
-	ts.syncTriggers()
-	mgr.AddInformers(ctx, ts.funcInformer)
-	mgr.AddInformers(ctx, ts.triggerInformer)
 	return nil
 }
 
@@ -144,6 +150,53 @@ func defaultHomeHandler(w http.ResponseWriter, r *http.Request) {
 
 func routerHealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+}
+
+// routerReadinessHandler reports 200 only once the first mux build has
+// succeeded (which happens after the Manager's trigger + function caches sync).
+// The kubelet keeps a freshly started or rolling router pod out of the Service
+// endpoints until its mux is populated, avoiding 404s for valid triggers during
+// startup and rolling updates. /router-healthz stays a cheap liveness check.
+func (ts *HTTPTriggerSet) routerReadinessHandler(w http.ResponseWriter, r *http.Request) {
+	// ready flips true after the first successful mux build, which only happens
+	// once the Manager's trigger + function caches have synced. Until then the
+	// mux has no user routes, so report 503 to stay out of the Service endpoints.
+	if !ts.ready.Load() {
+		http.Error(w, "router mux not yet built", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// panicRecoveryMiddleware keeps a single panicking request (e.g. a write
+// failure deep inside the reverse proxy) from crashing the whole router
+// process and dropping every other in-flight request. It is installed inside
+// buildMuxes so it survives the atomic mux swap and applies to both the public
+// and internal listeners.
+func panicRecoveryMiddleware(logger logr.Logger) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				rec := recover()
+				if rec == nil {
+					return
+				}
+				// net/http uses ErrAbortHandler as a sentinel for an
+				// intentional abort; re-panic so its own recover handles it.
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
+				logger.Error(nil, "recovered from panic in handler",
+					"panic", fmt.Sprintf("%v", rec),
+					"path", r.URL.Path, "method", r.Method)
+				// Best effort: sets 502 if nothing was written yet. If the
+				// response is already underway (e.g. a hijacked/streamed
+				// connection) net/http ignores this with a logged warning.
+				w.WriteHeader(http.StatusBadGateway)
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func versionHandler(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +229,7 @@ func versionHandler(w http.ResponseWriter, r *http.Request) {
 // hmac.Verifier in the bundle process; the verifier is intentionally
 // not added here so this function stays unit-testable without HMAC env
 // state.
-func (ts *HTTPTriggerSet) buildMuxes(fnTimeoutMap map[types.UID]int) (public, internal *mux.Router, err error) {
+func (ts *HTTPTriggerSet) buildMuxes(ctx context.Context, fnTimeoutMap map[types.UID]int) (public, internal *mux.Router, err error) {
 	featureConfig, err := config.GetFeatureConfig(ts.logger)
 	if err != nil {
 		return nil, nil, err
@@ -194,6 +247,11 @@ func (ts *HTTPTriggerSet) buildMuxes(fnTimeoutMap map[types.UID]int) (public, in
 		internal = internal.UseEncodedPath()
 	}
 
+	// Panic recovery is the outermost middleware so it also catches panics in
+	// the metrics/auth middleware below. Applied to both listeners.
+	public.Use(panicRecoveryMiddleware(ts.logger))
+	internal.Use(panicRecoveryMiddleware(ts.logger))
+
 	public.Use(metrics.HTTPMetricMiddleware)
 	if featureConfig.AuthConfig.IsEnabled {
 		public.Use(authMiddleware(featureConfig))
@@ -204,8 +262,17 @@ func (ts *HTTPTriggerSet) buildMuxes(fnTimeoutMap map[types.UID]int) (public, in
 	for i := range ts.triggers {
 		trigger := ts.triggers[i]
 
+		// Skip triggers whose CORS / ingress config is invalid. Registering a
+		// route for one would apply broken CORS or a malformed ingress path;
+		// the RouteAdmitted=False condition (set by the post-build loop in
+		// updateRouter) tells the user why the route is not served. The
+		// httptrigger admission webhook used to reject these.
+		if _, err := triggerConfigError(&trigger); err != nil {
+			continue
+		}
+
 		// resolve function reference
-		rr, err := ts.resolver.resolve(trigger)
+		rr, err := ts.resolver.resolve(ctx, trigger)
 		if err != nil {
 			// Unresolvable function reference. Report the error via
 			// the trigger's status.
@@ -216,23 +283,24 @@ func (ts *HTTPTriggerSet) buildMuxes(fnTimeoutMap map[types.UID]int) (public, in
 		}
 
 		if rr.resolveResultType != resolveResultSingleFunction && rr.resolveResultType != resolveResultMultipleFunctions {
-			// not implemented yet
+			// Unsupported resolve result type. Report it via the trigger's
+			// status and skip the route (let it 404) instead of crashing the
+			// whole router process and dropping every other trigger with it.
 			ts.logger.Error(nil, "resolve result type not implemented", "type", rr.resolveResultType)
-			os.Exit(1)
+			go ts.updateTriggerStatusFailed(&trigger, fmt.Errorf("resolve result type not implemented: %v", rr.resolveResultType))
+			continue
 		}
 
 		fh := &functionHandler{
 			logger:                   ts.logger.WithName(trigger.Name),
-			fmap:                     ts.functionServiceMap,
-			executor:                 ts.executor,
+			resolver:                 ts.addressResolver,
+			tapper:                   ts.tapper,
 			httpTrigger:              &trigger,
 			functionMap:              rr.functionMap,
 			fnWeightDistributionList: rr.functionWtDistributionList,
 			tsRoundTripperParams:     ts.tsRoundTripperParams,
 			isDebugEnv:               ts.isDebugEnv,
-			svcAddrUpdateThrottler:   ts.svcAddrUpdateThrottler,
 			functionTimeoutMap:       fnTimeoutMap,
-			unTapServiceTimeout:      ts.unTapServiceTimeout,
 		}
 
 		// The functionHandler for HTTP trigger with fn reference type "FunctionReferenceTypeFunctionName",
@@ -331,15 +399,13 @@ func (ts *HTTPTriggerSet) buildMuxes(fnTimeoutMap map[types.UID]int) (public, in
 	for i := range ts.functions {
 		fn := ts.functions[i]
 		fh := &functionHandler{
-			logger:                 ts.logger.WithName(fn.Name),
-			fmap:                   ts.functionServiceMap,
-			function:               &fn,
-			executor:               ts.executor,
-			tsRoundTripperParams:   ts.tsRoundTripperParams,
-			isDebugEnv:             ts.isDebugEnv,
-			svcAddrUpdateThrottler: ts.svcAddrUpdateThrottler,
-			functionTimeoutMap:     fnTimeoutMap,
-			unTapServiceTimeout:    ts.unTapServiceTimeout,
+			logger:               ts.logger.WithName(fn.Name),
+			resolver:             ts.addressResolver,
+			tapper:               ts.tapper,
+			function:             &fn,
+			tsRoundTripperParams: ts.tsRoundTripperParams,
+			isDebugEnv:           ts.isDebugEnv,
+			functionTimeoutMap:   fnTimeoutMap,
 		}
 
 		internalRoute := utils.UrlForFunction(fn.Name, fn.Namespace)
@@ -365,6 +431,10 @@ func (ts *HTTPTriggerSet) buildMuxes(fnTimeoutMap map[types.UID]int) (public, in
 	// working without HMAC credentials. Router-owned route; deny CORS
 	// preflights (OPTIONS registered so mux routes them to DenyAllCORS).
 	public.Handle("/router-healthz", httpsecurity.DenyAllCORS(http.HandlerFunc(routerHealthHandler))).Methods(http.MethodGet, http.MethodOptions)
+	// Readiness probe: 200 only once informer caches have synced. Public
+	// listener, next to /router-healthz; no HMAC needed. Router-owned route;
+	// deny CORS (OPTIONS registered so mux routes preflights to DenyAllCORS).
+	public.Handle("/readyz", httpsecurity.DenyAllCORS(http.HandlerFunc(ts.routerReadinessHandler))).Methods(http.MethodGet, http.MethodOptions)
 	// version of application; router-owned route; deny CORS.
 	public.Handle("/_version", httpsecurity.DenyAllCORS(http.HandlerFunc(versionHandler))).Methods(http.MethodGet, http.MethodOptions)
 
@@ -400,6 +470,23 @@ func toAllowlistConfig(cfg *fv1.HTTPTriggerCorsConfig, triggerMethods []string) 
 		AllowCredentials: cfg.AllowCredentials,
 		MaxAge:           maxAge,
 	}
+}
+
+// triggerConfigError reports whether an HTTPTrigger's CORS or ingress
+// configuration is invalid, returning the matching RouteAdmitted Reason and the
+// error, or ("", nil) when the config is valid. These checks rely on Go parsers
+// (url.Parse, time.ParseDuration, regexp.CompilePOSIX) that CRD CEL cannot
+// express; with the httptrigger admission webhook removed, the router validates
+// here and surfaces the result as the trigger's RouteAdmitted condition instead
+// of rejecting at admission. (CorsConfig.Validate is nil-safe.)
+func triggerConfigError(trigger *fv1.HTTPTrigger) (reason string, err error) {
+	if e := trigger.Spec.CorsConfig.Validate(); e != nil {
+		return fv1.HTTPTriggerReasonInvalidCorsConfig, e
+	}
+	if e := trigger.Spec.IngressConfig.Validate(); e != nil {
+		return fv1.HTTPTriggerReasonInvalidIngressConfig, e
+	}
+	return "", nil
 }
 
 func (ts *HTTPTriggerSet) updateTriggerStatusFailed(ht *fv1.HTTPTrigger, err error) {
@@ -454,88 +541,6 @@ func (ts *HTTPTriggerSet) markTriggerCondition(ctx context.Context, trigger *fv1
 	}
 }
 
-func (ts *HTTPTriggerSet) addTriggerHandlers() error {
-	for _, triggerInformer := range ts.triggerInformer {
-		_, err := triggerInformer.AddEventHandler(k8sCache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj any) {
-				trigger := obj.(*fv1.HTTPTrigger)
-				go createIngress(context.Background(), ts.logger, trigger, ts.kubeClient)
-				ts.syncTriggers()
-			},
-			DeleteFunc: func(obj any) {
-				ts.syncTriggers()
-				trigger := obj.(*fv1.HTTPTrigger)
-				go deleteIngress(context.Background(), ts.logger, trigger, ts.kubeClient)
-			},
-			UpdateFunc: func(oldObj any, newObj any) {
-				oldTrigger := oldObj.(*fv1.HTTPTrigger)
-				newTrigger := newObj.(*fv1.HTTPTrigger)
-
-				// Skip status-only updates: our own markTriggerCondition
-				// writes bump RV but leave Generation untouched. If we
-				// re-synced on every status-only update we'd loop on our
-				// own writes (mux rebuild → status write → informer
-				// fires → mux rebuild).
-				if oldTrigger.Generation == newTrigger.Generation {
-					return
-				}
-
-				go updateIngress(context.Background(), ts.logger, oldTrigger, newTrigger, ts.kubeClient)
-				ts.syncTriggers()
-			},
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (ts *HTTPTriggerSet) addFunctionHandlers() error {
-	for _, funcInformer := range ts.funcInformer {
-
-		_, err := funcInformer.AddEventHandler(k8sCache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj any) {
-				ts.syncTriggers()
-			},
-			DeleteFunc: func(obj any) {
-				ts.syncTriggers()
-			},
-			UpdateFunc: func(oldObj any, newObj any) {
-				oldFn := oldObj.(*fv1.Function)
-				fn := newObj.(*fv1.Function)
-
-				// Generation-based comparison filters out status-only
-				// updates (executor's FunctionConditionReady writes go
-				// through the status subresource and don't bump
-				// Generation). Without this, every cold-start specialization
-				// would invalidate the resolver cache and force a full
-				// mux rebuild on the next request.
-				if oldFn.Generation == fn.Generation {
-					return
-				}
-
-				// update resolver function reference cache
-				for key, rr := range ts.resolver.copy() {
-					if key.namespace == fn.Namespace &&
-						rr.functionMap[fn.Name] != nil &&
-						rr.functionMap[fn.Name].ResourceVersion != fn.ResourceVersion {
-						// invalidate resolver cache
-						ts.logger.V(1).Info("invalidating resolver cache")
-						ts.resolver.delete(key.namespace, key.triggerName, key.triggerResourceVersion)
-						break
-					}
-				}
-				ts.syncTriggers()
-			},
-		})
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (ts *HTTPTriggerSet) syncTriggers() {
 	ts.syncDebouncer(func() {
 		ts.updateRouterRequestChannel <- struct{}{}
@@ -549,28 +554,27 @@ func (ts *HTTPTriggerSet) updateRouter(ctx context.Context) {
 			return
 		case <-ts.updateRouterRequestChannel:
 		}
-		// get triggers
-		alltriggers := make([]fv1.HTTPTrigger, 0)
-		for _, triggerInformer := range ts.triggerInformer {
-			latestTriggers := triggerInformer.GetStore().List()
-			for _, t := range latestTriggers {
-				alltriggers = append(alltriggers, *t.(*fv1.HTTPTrigger))
-			}
+		// get triggers + functions from the Manager's cache (scoped to the
+		// Fission-watched namespaces via FissionCacheOptions).
+		var triggerList fv1.HTTPTriggerList
+		if err := ts.client.List(ctx, &triggerList); err != nil {
+			ts.logger.Error(err, "error listing http triggers; skipping mux rebuild")
+			continue
 		}
-		ts.triggers = alltriggers
+		ts.triggers = triggerList.Items
 
-		// get functions
-		allfunctions := make([]fv1.Function, 0)
-		functionTimeout := make(map[types.UID]int, 0)
-		for _, funcInformer := range ts.funcInformer {
-			latestFunctions := funcInformer.GetStore().List()
-			for _, f := range latestFunctions {
-				fn := *f.(*fv1.Function)
-				functionTimeout[fn.UID] = fn.Spec.FunctionTimeout
-				allfunctions = append(allfunctions, fn)
-			}
+		var functionList fv1.FunctionList
+		if err := ts.client.List(ctx, &functionList); err != nil {
+			ts.logger.Error(err, "error listing functions; skipping mux rebuild")
+			continue
+		}
+		allfunctions := functionList.Items
+		functionTimeout := make(map[types.UID]int, len(allfunctions))
+		for i := range allfunctions {
+			functionTimeout[allfunctions[i].UID] = allfunctions[i].Spec.FunctionTimeout
 		}
 		ts.functions = allfunctions
+		alltriggers := ts.triggers
 
 		// Rebuild both muxes from the same function snapshot then swap
 		// each in turn. The two updateRouter calls are sequential, not
@@ -581,7 +585,7 @@ func (ts *HTTPTriggerSet) updateRouter(ctx context.Context) {
 		// listener is consistent in steady state. True atomicity across
 		// listeners would require a shared atomic.Pointer holding both
 		// muxes; not worth the complexity for this case.
-		public, internal, err := ts.buildMuxes(functionTimeout)
+		public, internal, err := ts.buildMuxes(ctx, functionTimeout)
 		if err != nil {
 			ts.logger.Error(err, "error updating router")
 			// Flip every trigger to Ready=False so consumers polling
@@ -599,12 +603,24 @@ func (ts *HTTPTriggerSet) updateRouter(ctx context.Context) {
 		if ts.internalMutableRouter != nil {
 			ts.internalMutableRouter.updateRouter(internal)
 		}
+		// The mux now serves user routes — report ready (gates /readyz).
+		ts.ready.Store(true)
 
 		// Mark each trigger admitted now that its routes are live. We
 		// do this after the swap so the condition reflects observable
 		// state, not just intent. Best-effort; never blocks subsequent
 		// mux updates.
 		for i := range alltriggers {
+			// Triggers with invalid CORS/ingress config were skipped in
+			// buildMuxes; report that as RouteAdmitted=False (the Go-parser
+			// checks CEL can't express) instead of a stale True.
+			if reason, cfgErr := triggerConfigError(&alltriggers[i]); cfgErr != nil {
+				ts.markTriggerCondition(ctx, &alltriggers[i],
+					metav1.ConditionFalse, reason,
+					"router rejected the trigger configuration: "+cfgErr.Error(),
+					"trigger is not serving due to invalid configuration")
+				continue
+			}
 			ts.markTriggerCondition(ctx, &alltriggers[i],
 				metav1.ConditionTrue, fv1.HTTPTriggerReasonRouteAdmitted,
 				"router accepted the trigger and installed its mux entry",

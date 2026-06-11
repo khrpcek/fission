@@ -1,18 +1,6 @@
-/*
-Copyright 2026 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package v1
 
@@ -23,6 +11,9 @@ const (
 	// Function conditions
 	FunctionConditionReady        = "Ready"
 	FunctionConditionPackageReady = "PackageReady"
+	// FunctionConditionToolExposed reports whether the MCP server is advertising
+	// this function as a tool (set by pkg/mcp's reconciler).
+	FunctionConditionToolExposed = "ToolExposed"
 
 	// Package conditions
 	PackageConditionBuildSucceeded = "BuildSucceeded"
@@ -71,9 +62,11 @@ const (
 // logs, not in condition history.
 const (
 	// Function condition reasons
-	FunctionReasonReady         = "Available"          // executor: backend is serving requests
-	FunctionReasonPackageReady  = "PackageReady"       // buildermgr: package built
-	FunctionReasonPackageFailed = "PackageBuildFailed" // buildermgr: package build failed
+	FunctionReasonReady            = "Available"          // executor: backend is serving requests
+	FunctionReasonPackageReady     = "PackageReady"       // buildermgr: package built
+	FunctionReasonPackageFailed    = "PackageBuildFailed" // buildermgr: package build failed
+	FunctionReasonToolExposed      = "ToolExposed"        // mcp: advertised as an MCP tool
+	FunctionReasonToolNameConflict = "ToolNameConflict"   // mcp: tool name already used by another function
 
 	// Package condition reasons (mirror BuildStatus enum + composites)
 	PackageReasonBuildSucceeded  = "BuildSucceeded"
@@ -87,8 +80,10 @@ const (
 	// See pkg/buildermgr/envwatcher.go.AddUpdateBuilder for why.
 
 	// HTTPTrigger condition reasons
-	HTTPTriggerReasonRouteAdmitted = "RouteAdmitted"
-	HTTPTriggerReasonMuxBuildFail  = "MuxBuildFailed"
+	HTTPTriggerReasonRouteAdmitted        = "RouteAdmitted"
+	HTTPTriggerReasonMuxBuildFail         = "MuxBuildFailed"
+	HTTPTriggerReasonInvalidCorsConfig    = "InvalidCorsConfig"    // CORS origin/max-age failed url.Parse/time.ParseDuration
+	HTTPTriggerReasonInvalidIngressConfig = "InvalidIngressConfig" // ingress path/host failed POSIX-regex/DNS validation
 
 	// KubernetesWatchTrigger condition reasons
 	KubernetesWatchTriggerReasonSubscribed  = "Subscribed"
@@ -96,6 +91,7 @@ const (
 
 	// TimeTrigger condition reasons
 	TimeTriggerReasonCronRegistered = "CronRegistered"
+	TimeTriggerReasonInvalidCron    = "InvalidCron" // cron failed the robfig/cron parser (CEL cannot express it)
 
 	// MessageQueueTrigger condition reasons
 	MessageQueueTriggerReasonSubscribed = "Subscribed"

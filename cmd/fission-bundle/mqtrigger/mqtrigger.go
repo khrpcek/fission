@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package mqtrigger
 
@@ -22,25 +10,33 @@ import (
 	"os"
 	"path"
 	"strings"
-	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/crd"
-	genInformer "github.com/fission/fission/pkg/generated/informers/externalversions"
 	"github.com/fission/fission/pkg/mqtrigger"
 	"github.com/fission/fission/pkg/mqtrigger/factory"
 	"github.com/fission/fission/pkg/mqtrigger/messageQueue"
 	_ "github.com/fission/fission/pkg/mqtrigger/messageQueue/kafka"
-	"github.com/fission/fission/pkg/utils"
-	"github.com/fission/fission/pkg/utils/manager"
+	"github.com/fission/fission/pkg/utils/crmanager"
+	"github.com/fission/fission/pkg/utils/metrics"
 )
 
-func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr manager.Interface, routerUrl string) error {
+// mqtReconcileConcurrency lets independent MessageQueueTriggers subscribe in
+// parallel, matching the throughput of the previous 4 create/update workers.
+const mqtReconcileConcurrency = 4
+
+func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, _ *errgroup.Group, routerUrl string) error {
 	fissionClient, err := clientGen.GetFissionClient()
 	if err != nil {
 		return fmt.Errorf("failed to get fission client: %w", err)
+	}
+	restConfig, err := clientGen.GetRestConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get rest config: %w", err)
 	}
 
 	err = crd.WaitForFunctionCRDs(ctx, logger, fissionClient)
@@ -73,29 +69,42 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		routerUrl,
 	)
 	if err != nil {
-		logger.Error(err, "failed to connect to remote message queue server")
-
-		os.Exit(1)
+		return fmt.Errorf("failed to connect to remote message queue server: %w", err)
 	}
 
-	finformerFactory := make(map[string]genInformer.SharedInformerFactory, 0)
-	for _, ns := range utils.DefaultNSResolver().FissionResourceNS {
-		finformerFactory[ns] = genInformer.NewSharedInformerFactoryWithOptions(fissionClient, time.Minute*30, genInformer.WithNamespace(ns))
-	}
-
-	mqtMgr, err := mqtrigger.MakeMessageQueueTriggerManager(logger, fissionClient, mqType, finformerFactory, mq)
+	// Active-passive HA via native controller-runtime leader election: only the
+	// elected leader consumes the message queue and manages triggers, so two
+	// replicas don't double-consume. No-op when LEADER_ELECTION_ENABLED is unset
+	// (single-replica default). The reconciler watches MessageQueueTriggers
+	// through the Manager's namespace-scoped cache and runs only on the leader.
+	crMgr, err := crmanager.NewLeaderElected(restConfig, "fission-mqtrigger", logger)
 	if err != nil {
 		return err
 	}
 
-	// Start informer factory
-	for _, factory := range finformerFactory {
-		factory.Start(ctx.Done())
+	// Serve the subsystem's custom metrics on every replica (the crmanager
+	// Manager's own metrics server is disabled), so a scrape hits whichever pod.
+	if err := crMgr.Add(crmanager.NonLeaderRunnable(func(c context.Context) error {
+		gm := &errgroup.Group{}
+		metrics.ServeMetrics(c, "mqtrigger", logger, gm)
+		<-c.Done()
+		return gm.Wait()
+	})); err != nil {
+		return err
 	}
 
-	mqtMgr.Run(ctx, ctx.Done(), mgr)
+	// The subscription manager (service() actor) is leader-only: only the leader
+	// holds live queue subscriptions, so a standby doesn't double-consume.
+	mqtMgr := mqtrigger.MakeMessageQueueTriggerManager(logger, fissionClient, mqType, mq)
+	if err := crMgr.Add(crmanager.LeaderRunnable(mqtMgr.Start)); err != nil {
+		return err
+	}
 
-	return nil
+	r := mqtrigger.NewMessageQueueTriggerReconciler(logger, crMgr.GetClient(), mqtMgr)
+	if err := controller.RegisterWithConcurrency(crMgr, &fv1.MessageQueueTrigger{}, r, "messagequeuetrigger", mqtReconcileConcurrency); err != nil {
+		return fmt.Errorf("error registering messagequeuetrigger reconciler: %w", err)
+	}
+	return crMgr.Start(ctx)
 }
 
 func readSecrets(logger logr.Logger, secretsPath string) (map[string][]byte, error) {

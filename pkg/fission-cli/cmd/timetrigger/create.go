@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package timetrigger
 
@@ -66,7 +54,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 
 	userProvidedNS, fnNamespace, err := opts.GetResourceNamespace(input, flagkey.NamespaceFunction)
 	if err != nil {
-		return fmt.Errorf("error in deleting function : %w", err)
+		return fmt.Errorf("error in creating time trigger : %w", err)
 	}
 
 	cronSpec := input.String(flagkey.TtCron)
@@ -126,19 +114,9 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 }
 
 func (opts *CreateSubCommand) run(input cli.Input) error {
-	// if we're writing a spec, don't call the API
-	// save to spec file or display the spec to console
-	if input.Bool(flagkey.SpecDry) {
-		return spec.SpecDry(*opts.trigger)
-	}
-
-	if input.Bool(flagkey.SpecSave) {
-		specFile := fmt.Sprintf("timetrigger-%v.yaml", opts.trigger.Name)
-		err := spec.SpecSave(*opts.trigger, specFile, false)
-		if err != nil {
-			return fmt.Errorf("error saving time trigger spec: %w", err)
-		}
-		return nil
+	// if we're writing a spec, don't call the API; save/print and return.
+	if handled, err := spec.SaveOrDry(input, *opts.trigger, fmt.Sprintf("timetrigger-%v.yaml", opts.trigger.Name)); handled {
+		return err
 	}
 
 	_, err := opts.Client().FissionClientSet.CoreV1().TimeTriggers(opts.trigger.Namespace).Create(input.Context(), opts.trigger, metav1.CreateOptions{})

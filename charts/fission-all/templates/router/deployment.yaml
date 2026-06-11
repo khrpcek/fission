@@ -13,6 +13,10 @@ metadata:
 spec:
 {{- if not .Values.router.deployAsDaemonSet }}
   replicas: {{ .Values.router.replicas | default 1 }}
+  {{- with .Values.router.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 {{- end }}
   selector:
     matchLabels:
@@ -81,6 +85,17 @@ spec:
           value: {{ .Values.router.svcAddressUpdateTimeout | default "30s" | quote }}
         - name: ROUTER_UNTAP_SERVICE_TIMEOUT
           value: {{ .Values.router.unTapServiceTimeout | default "3600s" | quote }}
+        {{- if kindIs "bool" .Values.router.endpointSliceCache.mode }}
+        {{- fail "router.endpointSliceCache.mode must be a quoted string (\"on\"/\"off\") — unquoted on/off are YAML 1.1 booleans, and an unquoted off would silently default back to \"on\"" }}
+        {{- end }}
+        {{- $epsMode := .Values.router.endpointSliceCache.mode | default "on" }}
+        {{- if not (has $epsMode (list "off" "on")) }}
+        {{- fail (printf "router.endpointSliceCache.mode must be one of off|on (shadow was removed with the RFC-0002 phase-4 defaults flip), got %q" $epsMode) }}
+        {{- end }}
+        - name: ROUTER_ENDPOINTSLICE_CACHE_MODE
+          value: {{ $epsMode | quote }}
+        - name: ROUTER_ENDPOINTSLICE_ENDPOINT_LB
+          value: {{ .Values.router.endpointSliceCache.endpointLB | default false | quote }}
         - name: USE_ENCODED_PATH
           value: {{ .Values.router.useEncodedPath | default false | quote }}
         - name: DEBUG_ENV
@@ -89,15 +104,22 @@ spec:
           value: {{ .Values.pprof.enabled | quote }}
         - name: DISPLAY_ACCESS_LOG
           value: {{ .Values.router.displayAccessLog | default false | quote }}
+        - name: GATEWAY_API_ENABLED
+          value: {{ .Values.gatewayAPI.enabled | default false | quote }}
+        {{- if .Values.gatewayAPI.defaultParentRef }}
+        - name: GATEWAY_DEFAULT_PARENTREF
+          value: {{ .Values.gatewayAPI.defaultParentRef | quote }}
+        {{- end }}
         {{- include "fission-resource-namespace.envs" . | indent 8 }}
         {{- include "kube_client.envs" . | indent 8 }}
         {{- include "opentelemtry.envs" . | indent 8 }}
         {{- include "internalAuth.envs" . | indent 8 }}
+        {{- include "coverage.envs" . | indent 8 }}
         resources:
           {{- toYaml .Values.router.resources | nindent 10 }}
         readinessProbe:
           httpGet:
-            path: "/router-healthz"
+            path: "/readyz"
             port: 8888
           initialDelaySeconds: 1
           periodSeconds: 1
@@ -112,6 +134,7 @@ spec:
         - name: config-volume
           mountPath: /etc/config/config.yaml
           subPath: config.yaml
+        {{- include "coverage.volumemount" . | indent 8 }}
         ports:
         - containerPort: 8080
           name: metrics
@@ -134,10 +157,14 @@ spec:
         terminationMessagePolicy: {{ .Values.terminationMessagePolicy }}
         {{- end }}
       serviceAccountName: fission-router
+      {{- with .Values.router.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
       volumes:
       - name: config-volume
         configMap:
           name: feature-config
+      {{- include "coverage.volume" . | indent 6 }}
 {{- if .Values.router.priorityClassName }}
       priorityClassName: {{ .Values.router.priorityClassName }}
 {{- else if .Values.priorityClassName }}

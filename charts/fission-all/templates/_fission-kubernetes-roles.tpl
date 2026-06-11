@@ -1,5 +1,42 @@
+{{/*
+leases-kuberules grants the permissions a control-plane subsystem needs for
+controller-runtime native leader election (active-passive HA): the
+coordination.k8s.io/leases lock plus events create/patch for the Manager's
+leader-election event recorder. Included by every subsystem that supports
+leader election. (Some roles also grant events for other reasons; duplicate
+rules are merged by the API server.)
+*/}}
+{{- define "leases-kuberules" }}
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+{{- end }}
 {{- define "buildermgr-kuberules" }}
 rules:
+{{- include "leases-kuberules" . }}
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - ""
   resources:
@@ -40,6 +77,7 @@ rules:
 {{- end }}
 {{- define "canaryconfig-kuberules" }}
 rules:
+{{- include "leases-kuberules" . }}
 - apiGroups:
   - ""
   resources:
@@ -65,11 +103,11 @@ rules:
 {{- end }}
 {{- define "executor-kuberules" }}
 rules:
+{{- include "leases-kuberules" . }}
 - apiGroups:
   - ""
   resources:
   - pods
-  - services
   - replicationcontrollers
   verbs:
   - create
@@ -78,6 +116,22 @@ rules:
   - list
   - watch
   - patch
+# Services additionally need `update`: AdoptExistingResources re-stamps an
+# existing Service in place (newdeploy/container createOrGetService), which the
+# executor never does in steady state — so without `update` adopt 403s on the
+# Service and aborts before re-stamping the backing Deployment.
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+  - patch
+  - update
 - apiGroups:
   - ""
   resources:
@@ -174,6 +228,7 @@ rules:
 {{- end }}
 {{- define "kubewatcher-kuberules" }}
 rules:
+{{- include "leases-kuberules" . }}
 - apiGroups:
   - ""
   resources:
@@ -206,6 +261,7 @@ rules:
 {{- end }}
 {{- define "kafka-kuberules" }}
 rules:
+{{- include "leases-kuberules" . }}
 - apiGroups:
   - ""
   resources:
@@ -254,6 +310,7 @@ rules:
 {{- end }}
 {{- define "keda-kuberules" }}
 rules:
+{{- include "leases-kuberules" . }}
 - apiGroups:
   - ""
   resources:
@@ -378,7 +435,34 @@ rules:
   - get
   - list
   - watch
+{{- if .Values.gatewayAPI.enabled }}
+# Gateway API route provider (gatewayAPI.enabled): the router creates HTTPRoute
+# objects per HTTPTrigger that requests the "gateway" provider. ReferenceGrants
+# are read-only — a cross-namespace HTTPRoute->Gateway parentRef requires a
+# ReferenceGrant the cluster operator owns; Fission does not create one.
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - referencegrants
+  verbs:
+  - get
+  - list
+  - watch
+{{- end }}
 {{- end }}
 {{- define "timer-kuberules" }}
-rules: []
+rules:
+{{- include "leases-kuberules" . }}
 {{- end }}

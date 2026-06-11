@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build integration
 
 package common_test
@@ -54,8 +58,8 @@ func TestBackendPoolmgr(t *testing.T) {
 	//   - the poolmgr executor marks the Function as Ready after
 	//     specializing a pool pod.
 	// Environment conditions are intentionally not written by any
-	// controller in this PR — status writes would bump env.RV which
-	// the buildermgr embeds in the builder service hostname. See
-	// pkg/buildermgr/envwatcher.go.AddUpdateBuilder for the note.
+	// controller — status writes would bump env.RV which the buildermgr
+	// embeds in the builder service hostname. See the note in
+	// pkg/buildermgr/environment_reconciler.go.Reconcile.
 	ns.WaitForFunctionConditionTrue(t, ctx, fnName, fv1.FunctionConditionReady, 30*time.Second)
 }

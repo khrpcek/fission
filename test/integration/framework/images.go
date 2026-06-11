@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build integration
 
 package framework
@@ -19,7 +23,12 @@ type RuntimeImages struct {
 	JVMBuilder       string
 	JVMJersey        string
 	JVMJerseyBuilder string
+	Rust             string
+	RustBuilder      string
 	TS               string
+	// Container is a plain HTTP-server image used by the container-executor
+	// backend test (it serves HTTP itself, unlike Fission runtime images).
+	Container string
 }
 
 func loadRuntimeImages() RuntimeImages {
@@ -34,7 +43,10 @@ func loadRuntimeImages() RuntimeImages {
 		JVMBuilder:       os.Getenv("JVM_BUILDER_IMAGE"),
 		JVMJersey:        os.Getenv("JVM_JERSEY_RUNTIME_IMAGE"),
 		JVMJerseyBuilder: os.Getenv("JVM_JERSEY_BUILDER_IMAGE"),
+		Rust:             os.Getenv("RUST_RUNTIME_IMAGE"),
+		RustBuilder:      os.Getenv("RUST_BUILDER_IMAGE"),
 		TS:               os.Getenv("TS_RUNTIME_IMAGE"),
+		Container:        os.Getenv("CONTAINER_RUNTIME_IMAGE"),
 	}
 }
 
@@ -73,6 +85,21 @@ func (r RuntimeImages) RequireJVMJersey(skip skipper) string {
 	return requireImage(skip, "JVM_JERSEY_RUNTIME_IMAGE", r.JVMJersey)
 }
 
+// RequireJVMJerseyBuilder skips the test if JVM_JERSEY_BUILDER_IMAGE is unset.
+func (r RuntimeImages) RequireJVMJerseyBuilder(skip skipper) string {
+	return requireImage(skip, "JVM_JERSEY_BUILDER_IMAGE", r.JVMJerseyBuilder)
+}
+
+// RequireRust skips the test if RUST_RUNTIME_IMAGE is unset.
+func (r RuntimeImages) RequireRust(skip skipper) string {
+	return requireImage(skip, "RUST_RUNTIME_IMAGE", r.Rust)
+}
+
+// RequireRustBuilder skips the test if RUST_BUILDER_IMAGE is unset.
+func (r RuntimeImages) RequireRustBuilder(skip skipper) string {
+	return requireImage(skip, "RUST_BUILDER_IMAGE", r.RustBuilder)
+}
+
 // RequireJVM skips the test if JVM_RUNTIME_IMAGE is unset.
 func (r RuntimeImages) RequireJVM(skip skipper) string {
 	return requireImage(skip, "JVM_RUNTIME_IMAGE", r.JVM)
@@ -81,6 +108,13 @@ func (r RuntimeImages) RequireJVM(skip skipper) string {
 // RequireJVMBuilder skips the test if JVM_BUILDER_IMAGE is unset.
 func (r RuntimeImages) RequireJVMBuilder(skip skipper) string {
 	return requireImage(skip, "JVM_BUILDER_IMAGE", r.JVMBuilder)
+}
+
+// RequireContainer skips the test if CONTAINER_RUNTIME_IMAGE is unset. It
+// should point at a small image that serves HTTP on its port (the
+// container-executor backend invokes the user image directly).
+func (r RuntimeImages) RequireContainer(skip skipper) string {
+	return requireImage(skip, "CONTAINER_RUNTIME_IMAGE", r.Container)
 }
 
 func requireImage(skip skipper, envVar, value string) string {
@@ -119,6 +153,19 @@ func routerInternalURLFromEnv() string {
 		return "http://" + v
 	}
 	return "http://127.0.0.1:8889"
+}
+
+// mcpBaseURLFromEnv returns the URL the framework should use for the MCP server
+// (svc/mcp). Defaults to http://127.0.0.1:8890 to match the suite-bootstrap
+// port-forward; override via FISSION_MCP_BASE_URL. Empty disables the MCP tests.
+func mcpBaseURLFromEnv() string {
+	if v := os.Getenv("FISSION_MCP_BASE_URL"); v != "" {
+		if hasScheme(v) {
+			return v
+		}
+		return "http://" + v
+	}
+	return "http://127.0.0.1:8890"
 }
 
 // internalAuthSecretFromEnv returns the master HMAC key used to sign

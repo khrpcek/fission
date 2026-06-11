@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package dummy
 
@@ -101,62 +89,6 @@ func (u Cli) Int64(key string) int64 {
 }
 
 func (u Cli) Int64Slice(key string) []int64 {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return nil
-	}
-	return val.([]int64)
-}
-
-func (u Cli) GlobalBool(key string) bool {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return false
-	}
-	return val.(bool)
-}
-
-func (u Cli) GlobalString(key string) string {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return ""
-	}
-	return val.(string)
-}
-
-func (u Cli) GlobalStringSlice(key string) []string {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return nil
-	}
-	return val.([]string)
-}
-
-func (u Cli) GlobalInt(key string) int {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return 0
-	}
-	return val.(int)
-}
-
-func (u Cli) GlobalIntSlice(key string) []int {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return nil
-	}
-	return val.([]int)
-}
-
-func (u Cli) GlobalInt64(key string) int64 {
-	val, ok := u.c[key]
-	if !ok || val == nil {
-		return 0
-	}
-	return val.(int64)
-}
-
-func (u Cli) GlobalInt64Slice(key string) []int64 {
 	val, ok := u.c[key]
 	if !ok || val == nil {
 		return nil

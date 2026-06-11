@@ -1,23 +1,12 @@
-/*
-Copyright 2026 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package newdeploy
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -26,8 +15,13 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	ferror "github.com/fission/fission/pkg/error"
+	"github.com/fission/fission/pkg/executor/fscache"
 	"github.com/fission/fission/pkg/executor/util"
+	hpautils "github.com/fission/fission/pkg/executor/util/hpa"
 	fetcherConfig "github.com/fission/fission/pkg/fetcher/config"
+	fissionfake "github.com/fission/fission/pkg/generated/clientset/versioned/fake"
+	"github.com/fission/fission/pkg/utils"
 	"github.com/fission/fission/pkg/utils/loggerfactory"
 )
 
@@ -86,6 +80,195 @@ func newTestNewDeployFunction() *fv1.Function {
 			},
 		},
 	}
+}
+
+// TestMainContainerName covers mainContainerName, the helper shared by the
+// deployment-spec builder and the HPA call site. The updateFunction path relies
+// on its error branch to refuse rewriting the ContainerResource metric to a
+// container that does not exist in the pod spec.
+func TestMainContainerName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		mutate  func(env *fv1.Environment)
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "defaults to env name when no custom runtime container",
+			mutate: func(*fv1.Environment) {},
+			want:   envCName,
+		},
+		{
+			name: "uses custom runtime container name present in pod spec",
+			mutate: func(env *fv1.Environment) {
+				env.Spec.Runtime.Container = &apiv1.Container{Name: "custom-runtime"}
+				env.Spec.Runtime.PodSpec = &apiv1.PodSpec{
+					Containers: []apiv1.Container{{Name: "custom-runtime"}},
+				}
+			},
+			want: "custom-runtime",
+		},
+		{
+			name: "errors when custom runtime container absent from pod spec",
+			mutate: func(env *fv1.Environment) {
+				env.Spec.Runtime.Container = &apiv1.Container{Name: "custom-runtime"}
+				env.Spec.Runtime.PodSpec = &apiv1.PodSpec{
+					Containers: []apiv1.Container{{Name: "some-other-container"}},
+				}
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			deploy := newTestNewDeploy(t)
+			env := newTestNewDeployEnv()
+			tc.mutate(env)
+
+			got, err := deploy.mainContainerName(env)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestNewDeployFnDeleteCacheMiss verifies that deleting a function whose fsvc
+// is absent from the in-memory cache (never specialized, evicted, or executor
+// restarted) does not error out — it must fall back to the deterministic
+// computed object name and clean up the backing objects instead of leaking
+// them.
+func TestNewDeployFnDeleteCacheMiss(t *testing.T) {
+	logger := loggerfactory.GetLogger()
+	deploy := &NewDeploy{
+		logger:           logger,
+		kubernetesClient: fake.NewSimpleClientset(),
+		fsCache:          fscache.MakeFunctionServiceCache(logger),
+		nsResolver:       utils.DefaultNSResolver(),
+		hpaops:           hpautils.NewHpaOperations(logger, fake.NewSimpleClientset(), "test-instance"),
+	}
+
+	fn := newTestNewDeployFunction()
+	fn.UID = "abcdef01-2345-6789-abcd-ef0123456789"
+
+	// fsCache is intentionally left empty so GetByFunctionUID misses.
+	require.NoError(t, deploy.fnDelete(t.Context(), fn),
+		"fnDelete must tolerate a cache miss and clean up by computed name")
+}
+
+// TestNewDeployFnCreateDeletionGuard verifies the authoritative re-read at the
+// top of fnCreate refuses to create backing objects for a Function that the
+// router presented but which is gone or being deleted in the cluster. Without
+// this guard an in-flight create can race the delete teardown and re-create the
+// Deployment/Service/HPA after teardown removed them, leaking objects whose
+// owning Function CR is already gone.
+func TestNewDeployFnCreateDeletionGuard(t *testing.T) {
+	t.Parallel()
+
+	const liveUID = "abcdef01-2345-6789-abcd-ef0123456789"
+
+	tests := []struct {
+		name string
+		// stored is the Function in the authoritative store (fake
+		// fissionClient); nil means the function is absent.
+		stored *fv1.Function
+	}{
+		{
+			name:   "function absent from fissionClient",
+			stored: nil,
+		},
+		{
+			name: "function present but being deleted",
+			stored: func() *fv1.Function {
+				fn := newTestNewDeployFunction()
+				fn.UID = liveUID
+				fn.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+				fn.Finalizers = []string{"fission.io/test"}
+				return fn
+			}(),
+		},
+		{
+			name: "function present but with a different UID",
+			stored: func() *fv1.Function {
+				fn := newTestNewDeployFunction()
+				fn.UID = "00000000-0000-0000-0000-000000000000"
+				return fn
+			}(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			logger := loggerfactory.GetLogger()
+			kubeClient := fake.NewSimpleClientset()
+			fissionClient := fissionfake.NewSimpleClientset()
+			if tc.stored != nil {
+				fissionClient = fissionfake.NewSimpleClientset(tc.stored)
+			}
+			deploy := &NewDeploy{
+				logger:           logger,
+				kubernetesClient: kubeClient,
+				fissionClient:    fissionClient,
+				fsCache:          fscache.MakeFunctionServiceCache(logger),
+				nsResolver:       utils.DefaultNSResolver(),
+				hpaops:           hpautils.NewHpaOperations(logger, kubeClient, "test-instance"),
+			}
+
+			// The Function the router presents looks alive (no DeletionTimestamp).
+			fn := newTestNewDeployFunction()
+			fn.UID = liveUID
+
+			_, err := deploy.fnCreate(t.Context(), fn)
+			require.Error(t, err, "fnCreate must refuse a gone/deleting function")
+			assert.True(t, ferror.IsNotFound(err),
+				"guard must surface a ferror NotFound, got: %v", err)
+
+			deploys, listErr := kubeClient.AppsV1().Deployments(metav1.NamespaceAll).List(t.Context(), metav1.ListOptions{})
+			require.NoError(t, listErr)
+			assert.Empty(t, deploys.Items,
+				"no Deployment must be created when the function is gone/deleting")
+		})
+	}
+}
+
+// TestNewDeployFnCreateGuardPass verifies the guard lets a live, matching
+// Function proceed past the re-read. We do not stand up a full happy-path
+// (Environment, package, pods); proving the guard passed is enough: fnCreate
+// fails later on the missing Environment with a non-NotFound error (a k8s
+// NotFound from the apiserver lookup, which is not a ferror NotFound).
+func TestNewDeployFnCreateGuardPass(t *testing.T) {
+	t.Parallel()
+
+	live := newTestNewDeployFunction()
+	live.UID = "abcdef01-2345-6789-abcd-ef0123456789"
+
+	logger := loggerfactory.GetLogger()
+	kubeClient := fake.NewSimpleClientset()
+	deploy := &NewDeploy{
+		logger:           logger,
+		kubernetesClient: kubeClient,
+		fissionClient:    fissionfake.NewSimpleClientset(live),
+		fsCache:          fscache.MakeFunctionServiceCache(logger),
+		nsResolver:       utils.DefaultNSResolver(),
+		hpaops:           hpautils.NewHpaOperations(logger, kubeClient, "test-instance"),
+	}
+
+	fn := newTestNewDeployFunction()
+	fn.UID = live.UID
+
+	_, err := deploy.fnCreate(t.Context(), fn)
+	require.Error(t, err, "expected fnCreate to fail past the guard on the missing Environment")
+	assert.False(t, ferror.IsNotFound(err),
+		"guard must have passed; the error should come from the missing Environment lookup, not the guard. got: %v", err)
 }
 
 // TestNewDeployPodSpecDoesNotAutomountTokenInUserContainer asserts the
@@ -259,4 +442,128 @@ func TestNewDeployPodSpecRuntimePodSpecCannotIntroduceDuplicateSATokenMount(t *t
 		"fetcher container must have exactly one mount at the SA token path; user-supplied mount at the same path must be stripped by MountFetcherSATokenOnFetcher")
 	assert.Equal(t, util.FetcherSATokenVolumeName, mountVolumeName,
 		"the surviving mount must be backed by the projected SA token volume, not the user-supplied one")
+}
+
+func ociTestPackage(deployment fv1.Archive) *fv1.Package {
+	return &fv1.Package{
+		ObjectMeta: metav1.ObjectMeta{Name: "pkg-1", Namespace: "default"},
+		Spec:       fv1.PackageSpec{Deployment: deployment},
+	}
+}
+
+// newTestOCINewDeploy wires a NewDeploy whose fissionClient holds pkg and
+// whose image-volume gate is set as given.
+func newTestOCINewDeploy(t *testing.T, pkg *fv1.Package, imageVolumeOK bool) *NewDeploy {
+	t.Helper()
+	deploy := newTestNewDeploy(t)
+	deploy.fissionClient = fissionfake.NewSimpleClientset(pkg)
+	deploy.imageVolumeOK = imageVolumeOK
+	return deploy
+}
+
+// TestGetDeploymentSpecOCIImageVolume asserts the newdeploy Path B pod shape:
+// the fetcher container STAYS (it materializes secrets and drives the load),
+// and the package image mounts read-only at the fetcher's store path on both
+// containers, so the fetcher's exists-early-exit skips the pull.
+func TestGetDeploymentSpecOCIImageVolume(t *testing.T) {
+	t.Parallel()
+	oci := &fv1.OCIArchive{
+		Image:            "registry.example.com/code/hello:v1",
+		ImagePullSecrets: []apiv1.LocalObjectReference{{Name: "regcred"}},
+	}
+	deploy := newTestOCINewDeploy(t, ociTestPackage(fv1.Archive{Type: fv1.ArchiveTypeOCI, OCI: oci}), true)
+	env := newTestNewDeployEnv()
+	env.Spec.Version = 2
+	fn := newTestNewDeployFunction()
+
+	dep, err := deploy.getDeploymentSpec(t.Context(), fn, env, nil,
+		"nd-oci", "default", map[string]string{"a": "b"}, map[string]string{})
+	require.NoError(t, err)
+	pod := dep.Spec.Template
+
+	// Both containers present: env runtime + fetcher.
+	var fetcher, user *apiv1.Container
+	for i := range pod.Spec.Containers {
+		switch pod.Spec.Containers[i].Name {
+		case util.FetcherContainerName:
+			fetcher = &pod.Spec.Containers[i]
+		case envCName:
+			user = &pod.Spec.Containers[i]
+		}
+	}
+	require.NotNil(t, fetcher, "newdeploy Path B keeps the fetcher container")
+	require.NotNil(t, user)
+
+	// Image volume present.
+	var imgVol *apiv1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Image != nil {
+			imgVol = &pod.Spec.Volumes[i]
+		}
+	}
+	require.NotNil(t, imgVol, "an image volume must be present")
+	assert.Equal(t, oci.Image, imgVol.Image.Reference)
+	assert.Equal(t, apiv1.PullIfNotPresent, imgVol.Image.PullPolicy)
+
+	// Mounted read-only at the fetcher's store path on BOTH containers.
+	wantPath := deploy.fetcherConfig.SharedMountPath() + "/" + fetcherConfig.TargetFilenameDeployArchive
+	for _, c := range []*apiv1.Container{fetcher, user} {
+		var mount *apiv1.VolumeMount
+		for i := range c.VolumeMounts {
+			if c.VolumeMounts[i].Name == imgVol.Name {
+				mount = &c.VolumeMounts[i]
+			}
+		}
+		require.NotNilf(t, mount, "container %s must mount the image volume", c.Name)
+		assert.Equal(t, wantPath, mount.MountPath)
+		assert.True(t, mount.ReadOnly)
+	}
+
+	// Pull secrets reach the pod; fetcher SA token mount intact; automount off.
+	assert.Contains(t, pod.Spec.ImagePullSecrets, apiv1.LocalObjectReference{Name: "regcred"})
+	hasSAToken := false
+	for _, vm := range fetcher.VolumeMounts {
+		if vm.MountPath == util.FetcherSATokenMountPath {
+			hasSAToken = true
+		}
+	}
+	assert.True(t, hasSAToken, "fetcher keeps its projected SA token mount")
+	require.NotNil(t, pod.Spec.AutomountServiceAccountToken)
+	assert.False(t, *pod.Spec.AutomountServiceAccountToken)
+}
+
+// TestGetDeploymentSpecOCIGateOff asserts Path A behavior when the gate is
+// off: no image volume; the fetcher pulls instead.
+func TestGetDeploymentSpecOCIGateOff(t *testing.T) {
+	t.Parallel()
+	oci := &fv1.OCIArchive{Image: "registry.example.com/code/hello:v1"}
+	deploy := newTestOCINewDeploy(t, ociTestPackage(fv1.Archive{Type: fv1.ArchiveTypeOCI, OCI: oci}), false)
+	env := newTestNewDeployEnv()
+	env.Spec.Version = 2
+	fn := newTestNewDeployFunction()
+
+	dep, err := deploy.getDeploymentSpec(t.Context(), fn, env, nil,
+		"nd-oci-off", "default", map[string]string{"a": "b"}, map[string]string{})
+	require.NoError(t, err)
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		assert.Nil(t, v.Image, "gate off must not produce an image volume")
+	}
+}
+
+// TestGetDeploymentSpecNonOCIUnchanged is the parity guard for tarball
+// packages with the gate ON: nothing about their pods changes.
+func TestGetDeploymentSpecNonOCIUnchanged(t *testing.T) {
+	t.Parallel()
+	deploy := newTestOCINewDeploy(t, ociTestPackage(fv1.Archive{Type: fv1.ArchiveTypeUrl, URL: "http://example.com/a.zip"}), true)
+	env := newTestNewDeployEnv()
+	env.Spec.Version = 2
+	fn := newTestNewDeployFunction()
+
+	dep, err := deploy.getDeploymentSpec(t.Context(), fn, env, nil,
+		"nd-tarball", "default", map[string]string{"a": "b"}, map[string]string{})
+	require.NoError(t, err)
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		assert.Nil(t, v.Image, "tarball packages must not grow an image volume")
+	}
+	assert.Empty(t, dep.Spec.Template.Spec.ImagePullSecrets)
 }

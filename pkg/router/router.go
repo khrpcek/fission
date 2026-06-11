@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 /*
 
@@ -41,25 +29,161 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
+	"golang.org/x/sync/errgroup"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	hmacauth "github.com/fission/fission/pkg/auth/hmac"
+	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/crd"
 	eclient "github.com/fission/fission/pkg/executor/client"
+	"github.com/fission/fission/pkg/generated/clientset/versioned/scheme"
+	"github.com/fission/fission/pkg/router/endpointcache"
 	"github.com/fission/fission/pkg/throttler"
+	"github.com/fission/fission/pkg/utils"
+	"github.com/fission/fission/pkg/utils/crmanager"
 	"github.com/fission/fission/pkg/utils/httpsecurity"
 	"github.com/fission/fission/pkg/utils/httpserver"
-	"github.com/fission/fission/pkg/utils/manager"
-	"github.com/fission/fission/pkg/utils/metrics"
+	fissionmetrics "github.com/fission/fission/pkg/utils/metrics"
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
+
+// routerScheme is the router Manager's scheme: the Fission CRD types plus the
+// Kubernetes built-ins (EndpointSlices for the RFC-0002 endpoint index).
+var routerScheme = runtime.NewScheme()
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(routerScheme))
+	utilruntime.Must(scheme.AddToScheme(routerScheme))
+}
+
+// sliceWatchNamespaces returns the namespaces the EndpointSlice informer
+// watches: the function namespaces (where the function Services live).
+func sliceWatchNamespaces() []string {
+	return utils.DefaultNSResolver().FunctionNamespaces()
+}
+
+// routerCacheOptions scopes the Manager cache. The trigger/function watches
+// stay on the Fission namespaces (crmanager.FissionCacheOptions); when the
+// EndpointSlice index is enabled, the slice watch is additionally label-bound
+// to Fission-managed slices and scoped to the function namespaces (where the
+// function Services live), keeping the informer memory proportional to
+// Fission's own objects.
+func routerCacheOptions(mode endpointSliceCacheMode) crcache.Options {
+	opts := crmanager.FissionCacheOptions()
+	if mode == endpointSliceCacheOff {
+		return opts
+	}
+	sliceNS := map[string]crcache.Config{}
+	for _, ns := range sliceWatchNamespaces() {
+		sliceNS[ns] = crcache.Config{}
+	}
+	opts.ByObject = map[client.Object]crcache.ByObject{
+		&discoveryv1.EndpointSlice{}: {
+			Label:      labels.SelectorFromSet(labels.Set{fv1.MANAGED_BY_LABEL: fv1.MANAGED_BY_VALUE}),
+			Namespaces: sliceNS,
+		},
+	}
+	return opts
+}
+
+// checkSliceWatchRBAC verifies — with an actionable error — that the router
+// can list and watch EndpointSlices in every namespace the slice informer
+// would watch. Without this preflight a missing Role leaves the manager cache
+// retrying a forbidden LIST forever: the router hangs not-ready and the only
+// symptom is a reflector error log. The chart renders the required Role +
+// RoleBinding (router/role-dataplane.yaml) whenever
+// router.endpointSliceCache.mode != off; bespoke-RBAC installs must mirror it.
+//
+// Callers degrade to mode=off on error rather than exiting: the slice cache is
+// a warm-path optimization with a full legacy fallback, and crash-looping the
+// data plane over a missing optimization grant (e.g. a GitOps prune dropping
+// the Role) would turn it into an outage.
+func checkSliceWatchRBAC(ctx context.Context, kubeClient kubernetes.Interface) error {
+	for _, ns := range sliceWatchNamespaces() {
+		for _, verb := range []string{"list", "watch"} {
+			sar := &authorizationv1.SelfSubjectAccessReview{
+				Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+					ResourceAttributes: &authorizationv1.ResourceAttributes{
+						Namespace: ns,
+						Verb:      verb,
+						Group:     "discovery.k8s.io",
+						Resource:  "endpointslices",
+					},
+				},
+			}
+			// Retry the review itself: a transient apiserver error during boot
+			// must not degrade the data plane for the router's whole lifetime.
+			// Only an explicit Allowed=false (genuinely missing RBAC) or a
+			// persistent API failure degrades.
+			var res *authorizationv1.SelfSubjectAccessReview
+			var err error
+			for attempt := range 3 {
+				if attempt > 0 {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(2 * time.Second):
+					}
+				}
+				res, err = kubeClient.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
+				if err == nil {
+					break
+				}
+			}
+			if err != nil {
+				return fmt.Errorf("error checking endpointslice RBAC in namespace %q: %w", ns, err)
+			}
+			if !res.Status.Allowed {
+				return fmt.Errorf("router is not allowed to %s endpointslices in namespace %q "+
+					"(reason: %s); the Helm chart renders the required router-dataplane Role for "+
+					"router.endpointSliceCache.mode != off — grant the RBAC to enable the EndpointSlice data plane", verb, ns, res.Status.Reason)
+			}
+		}
+	}
+	return nil
+}
+
+// runnableFunc adapts a function to a controller-runtime manager.Runnable.
+type runnableFunc func(context.Context) error
+
+func (f runnableFunc) Start(ctx context.Context) error { return f(ctx) }
+
+// bindAddr resolves a server bind address from env, defaulting to def and
+// prefixing ":" when only a port is given.
+func bindAddr(env, def string) string {
+	addr := os.Getenv(env)
+	if addr == "" {
+		addr = def
+	}
+	if !strings.Contains(addr, ":") {
+		addr = ":" + addr
+	}
+	return addr
+}
 
 // DefaultInternalListenerPort is the default port for the internal
 // listener that serves /fission-function/<ns>/<name>. It must match the
@@ -88,7 +212,7 @@ const internalListenerMaxBodyBytes int64 = 64 << 20
 // https://github.com/fission/fission/issues/1317) is applied by
 // httpTriggerSet.buildMuxes on every reconciliation rather than here,
 // so that the feature stays on across the atomic mux swaps.
-func router(ctx context.Context, logger logr.Logger, mgr manager.Interface, httpTriggerSet *HTTPTriggerSet) (*mutableRouter, *mutableRouter, error) {
+func router(ctx context.Context, logger logr.Logger, mgr *errgroup.Group, httpTriggerSet *HTTPTriggerSet) (*mutableRouter, *mutableRouter, error) {
 	publicMR := newMutableRouter(logger, mux.NewRouter())
 	internalMR := newMutableRouter(logger.WithName("internal"), mux.NewRouter())
 
@@ -99,7 +223,7 @@ func router(ctx context.Context, logger logr.Logger, mgr manager.Interface, http
 	return publicMR, internalMR, nil
 }
 
-func serve(ctx context.Context, logger logr.Logger, mgr manager.Interface, port int, internalPort int,
+func serve(ctx context.Context, logger logr.Logger, mgr *errgroup.Group, port int, internalPort int,
 	httpTriggerSet *HTTPTriggerSet) error {
 	publicMR, internalMR, err := router(ctx, logger, mgr, httpTriggerSet)
 	if err != nil {
@@ -116,8 +240,9 @@ func serve(ctx context.Context, logger logr.Logger, mgr manager.Interface, port 
 	publicHandler := httpsecurity.SecurityHeaders(
 		otelUtils.GetHandlerWithOTEL(publicMR, "fission-router", otelUtils.UrlsToIgnore("/router-healthz")),
 	)
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		httpserver.StartServer(ctx, logger, mgr, "router", fmt.Sprintf("%d", port), publicHandler)
+		return nil
 	})
 
 	// Internal listener for /fission-function/<ns>/<name>. We wrap the
@@ -153,8 +278,9 @@ func serve(ctx context.Context, logger logr.Logger, mgr manager.Interface, port 
 	internalHandler := httpsecurity.SecurityHeaders(
 		httpsecurity.DenyAllCORS(verifier(internalHandlerInner)),
 	)
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		httpserver.StartServer(ctx, logger, mgr, "router-internal", fmt.Sprintf("%d", internalPort), internalHandler)
+		return nil
 	})
 
 	return nil
@@ -167,7 +293,7 @@ func serve(ctx context.Context, logger logr.Logger, mgr manager.Interface, port 
 // so callers can omit the flag and still get the GHSA-3g33-6vg6-27m8
 // listener split — the public listener no longer registers those
 // routes, so the internal listener is mandatory.
-func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr manager.Interface, port int, internalPort int, executor eclient.ClientInterface) error {
+func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr *errgroup.Group, port int, internalPort int, executor eclient.ClientInterface) error {
 	if internalPort <= 0 {
 		internalPort = DefaultInternalListenerPort
 	}
@@ -184,103 +310,173 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	if err != nil {
 		return fmt.Errorf("error making the kube client: %w", err)
 	}
+	restConfig, err := clientGen.GetRestConfig()
+	if err != nil {
+		return fmt.Errorf("error getting rest config: %w", err)
+	}
 
 	err = crd.WaitForFunctionCRDs(ctx, logger, fissionClient)
 	if err != nil {
 		return fmt.Errorf("error waiting for CRDs: %w", err)
 	}
 
-	timeoutStr := os.Getenv("ROUTER_ROUND_TRIP_TIMEOUT")
-	timeout, err := time.ParseDuration(timeoutStr)
+	cfg, err := loadRouterConfig(logger)
 	if err != nil {
-		return fmt.Errorf("failed to parse timeout duration value('%s') from 'ROUTER_ROUND_TRIP_TIMEOUT': %w", timeoutStr, err)
+		return err
 	}
 
-	timeoutExponentStr := os.Getenv("ROUTER_ROUNDTRIP_TIMEOUT_EXPONENT")
-	timeoutExponent, err := strconv.Atoi(timeoutExponentStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse timeout exponent value('%s') from 'ROUTER_ROUNDTRIP_TIMEOUT_EXPONENT': %w", timeoutExponentStr, err)
+	// Route controller-runtime's internal logs (reflector list/watch failures,
+	// cache sync problems) through the router logger. Without this they are
+	// suppressed entirely — a forbidden informer LIST then manifests only as
+	// the router hanging not-ready, with nothing in the logs to say why.
+	ctrl.SetLogger(logger.WithName("controller-runtime"))
+
+	// The slice informer needs read RBAC in the function namespaces (the chart
+	// renders it when the mode isn't off). A missing grant would wedge the
+	// manager cache sync and hang the router not-ready, so degrade to the
+	// legacy data plane loudly instead. Checked before manager construction
+	// because the cache options depend on the (possibly downgraded) mode.
+	requestedMode := cfg.endpointSliceCacheMode
+	if cfg.endpointSliceCacheMode != endpointSliceCacheOff {
+		if rerr := checkSliceWatchRBAC(ctx, kubeClient); rerr != nil {
+			logger.Error(rerr, "disabling the EndpointSlice cache (degrading to the executor-RPC data plane)",
+				"requested_mode", cfg.endpointSliceCacheMode)
+			cfg.endpointSliceCacheMode = endpointSliceCacheOff
+		}
+	}
+	// Registered unconditionally so the requested-vs-effective mode is
+	// alertable: an absent series cannot distinguish "mode=off install" from
+	// "RBAC degrade silently turned the data plane off after a restart".
+	endpointcache.RegisterModeInfo(string(requestedMode), string(cfg.endpointSliceCacheMode), cfg.endpointSliceEndpointLB)
+
+	// The router runs under a controller-runtime Manager for lifecycle
+	// consistency with the rest of the control plane and to host the HTTPTrigger
+	// + Function reconcilers. It is stateless and replica-independent, so it
+	// uses NO leader election (every replica serves and reconciles its own mux).
+	// The Manager owns the metrics server and graceful shutdown; /router-healthz
+	// + /readyz stay on the public listener, so the Manager's own health
+	// server is disabled.
+	var alreadyRegistered prometheus.AlreadyRegisteredError
+	if err := ctrlmetrics.Registry.Register(fissionmetrics.Registry); err != nil && !errors.As(err, &alreadyRegistered) {
+		logger.Error(err, "failed to register fission metrics collectors")
 	}
 
-	keepAliveTimeStr := os.Getenv("ROUTER_ROUND_TRIP_KEEP_ALIVE_TIME")
-	keepAliveTime, err := time.ParseDuration(keepAliveTimeStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse keep alive duration value('%s') from 'ROUTER_ROUND_TRIP_KEEP_ALIVE_TIME': %w", keepAliveTimeStr, err)
+	metricsBind := bindAddr("METRICS_ADDR", "8080")
+	if ephemeral, _ := strconv.ParseBool(os.Getenv("FISSION_TEST_EPHEMERAL_SERVERS")); ephemeral {
+		// In-process e2e harness: bind an ephemeral metrics port to avoid clashes.
+		metricsBind = ":0"
 	}
 
-	disableKeepAliveStr := os.Getenv("ROUTER_ROUND_TRIP_DISABLE_KEEP_ALIVE")
-	disableKeepAlive, err := strconv.ParseBool(disableKeepAliveStr)
+	crMgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: routerScheme,
+		// Scope the shared cache to the Fission-watched namespaces. The
+		// reconcilers and updateRouter read HTTPTriggers + Functions through it,
+		// and the router's RBAC is per-namespace Roles (not a ClusterRole) — a
+		// cluster-wide cache's list/watch is forbidden, so its sync would time out
+		// and the manager would exit. See routerCacheOptions.
+		Cache:                  routerCacheOptions(cfg.endpointSliceCacheMode),
+		Metrics:                metricsserver.Options{BindAddress: metricsBind},
+		HealthProbeBindAddress: "0", // /router-healthz + /readyz stay on the public listener
+		LeaderElection:         false,
+		Logger:                 logger,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to parse enable keep alive value('%s') from 'ROUTER_ROUND_TRIP_DISABLE_KEEP_ALIVE': %w", disableKeepAliveStr, err)
+		return fmt.Errorf("unable to set up router manager: %w", err)
 	}
 
-	maxRetriesStr := os.Getenv("ROUTER_ROUND_TRIP_MAX_RETRIES")
-	maxRetries, err := strconv.Atoi(maxRetriesStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse max retries value('%s') from 'ROUTER_ROUND_TRIP_MAX_RETRIES': %w", maxRetriesStr, err)
-	}
-
-	isDebugEnvStr := os.Getenv("DEBUG_ENV")
-	isDebugEnv, err := strconv.ParseBool(isDebugEnvStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse debug env value('%s') from 'DEBUG_ENV': %w", isDebugEnvStr, err)
-	}
-
-	// svcAddrRetryCount is the max times for RetryingRoundTripper to retry with a specific service address
-	svcAddrRetryCountStr := os.Getenv("ROUTER_SVC_ADDRESS_MAX_RETRIES")
-	svcAddrRetryCount, err := strconv.Atoi(svcAddrRetryCountStr)
-	if err != nil {
-		svcAddrRetryCount = 5
-		logger.Error(err, "failed to parse service address retry count from 'ROUTER_SVC_ADDRESS_MAX_RETRIES' - set to the default value", "value", svcAddrRetryCountStr,
-			"default", svcAddrRetryCount)
-	}
-
-	// svcAddrUpdateTimeout is the timeout setting for a goroutine to wait for the update of a service entry.
-	// If the update process cannot be done within the timeout window, consider it failed.
-	svcAddrUpdateTimeoutStr := os.Getenv("ROUTER_SVC_ADDRESS_UPDATE_TIMEOUT")
-	svcAddrUpdateTimeout, err := time.ParseDuration(os.Getenv("ROUTER_SVC_ADDRESS_UPDATE_TIMEOUT"))
-	if err != nil {
-		svcAddrUpdateTimeout = 30 * time.Second
-		logger.Error(err, "failed to parse service address update timeout duration from 'ROUTER_ROUND_TRIP_SVC_ADDRESS_UPDATE_TIMEOUT' - set to the default value", "value", svcAddrUpdateTimeoutStr,
-			"default", svcAddrUpdateTimeout)
-	}
-
-	// unTapServiceTimeout is the timeout used as timeout in the request context of unTapService
-	unTapServiceTimeoutstr := os.Getenv("ROUTER_UNTAP_SERVICE_TIMEOUT")
-	unTapServiceTimeout, err := time.ParseDuration(unTapServiceTimeoutstr)
-	if err != nil {
-		unTapServiceTimeout = 3600 * time.Second
-		logger.Error(err, "failed to parse unTap service timeout duration from 'ROUTER_UNTAP_SERVICE_TIMEOUT' - set to the default value", "value", unTapServiceTimeoutstr,
-			"default", unTapServiceTimeout)
-	}
-
-	// see issue https://github.com/fission/fission/issues/1317
-	useEncodedPath, err := strconv.ParseBool(os.Getenv("USE_ENCODED_PATH"))
-	if err != nil {
-		return fmt.Errorf("failed to parse USE_ENCODED_PATH: %w", err)
-	}
-
-	triggers, err := makeHTTPTriggerSet(logger.WithName("triggerset"), fmap, fissionClient, kubeClient, executor, &tsRoundTripperParams{
-		timeout:           timeout,
-		timeoutExponent:   timeoutExponent,
-		disableKeepAlive:  disableKeepAlive,
-		keepAliveTime:     keepAliveTime,
-		maxRetries:        maxRetries,
-		svcAddrRetryCount: svcAddrRetryCount,
-	}, isDebugEnv, useEncodedPath, unTapServiceTimeout, throttler.MakeThrottler(svcAddrUpdateTimeout))
+	triggers, err := makeHTTPTriggerSet(logger.WithName("triggerset"), fmap, fissionClient, kubeClient, crMgr.GetClient(), executor, &tsRoundTripperParams{
+		timeout:           cfg.roundTripTimeout,
+		timeoutExponent:   cfg.timeoutExponent,
+		disableKeepAlive:  cfg.disableKeepAlive,
+		keepAliveTime:     cfg.keepAliveTime,
+		maxRetries:        cfg.maxRetries,
+		svcAddrRetryCount: cfg.svcAddrRetryCount,
+		streamIdleDefault: cfg.streamIdleDefault,
+	}, cfg.isDebugEnv, cfg.useEncodedPath, cfg.unTapServiceTimeout, throttler.MakeThrottler(cfg.svcAddrUpdateTimeout))
 	if err != nil {
 		return fmt.Errorf("error making HTTP trigger set: %w", err)
 	}
 
-	mgr.Add(ctx, func(ctx context.Context) {
-		metrics.ServeMetrics(ctx, "router", logger, mgr)
-	})
+	// EndpointSlice-fed endpoint index (RFC-0002). Every router replica watches
+	// independently (no leader election — that is the point: warm-path state is
+	// replica-local). The fallback resolver serves the warm path from the
+	// index and uses the executor for cold starts, capacity, and strict-mode
+	// functions.
+	if cfg.endpointSliceCacheMode != endpointSliceCacheOff {
+		index := endpointcache.NewIndex()
+		if err := endpointcache.RegisterInformer(ctx, crMgr, index, logger); err != nil {
+			return fmt.Errorf("error registering endpointslice informer: %w", err)
+		}
+		endpointcache.RegisterSizeGauge(index)
+		execResolver, ok := triggers.addressResolver.(*executorResolver)
+		if !ok {
+			return fmt.Errorf("unexpected address resolver type %T", triggers.addressResolver)
+		}
+		switch cfg.endpointSliceCacheMode {
+		case endpointSliceCacheOn:
+			// The client interface carries EnsureCapacity since phase 4; an
+			// OLD executor (predating /v2/ensureCapacity) still degrades at
+			// runtime via the 404 → legacy-RPC fallback in the resolver.
+			triggers.addressResolver = newFallbackResolver(logger, index, execResolver, executor, cfg.endpointSliceEndpointLB)
+		default:
+			// Unreachable: loadRouterConfig validates the mode. The guard
+			// keeps a future refactor from silently paying for the informer
+			// while leaving the legacy resolver wired.
+			return fmt.Errorf("unhandled endpointslice cache mode %q", cfg.endpointSliceCacheMode)
+		}
+		logger.Info("endpointslice cache enabled", "mode", cfg.endpointSliceCacheMode, "endpoint_lb", cfg.endpointSliceEndpointLB)
+	}
+
+	// Build the route providers. The ingress provider is always registered (it
+	// serves the deprecated CreateIngress path); the gateway provider is added
+	// only when GATEWAY_API_ENABLED is set, so its RBAC is needed only when
+	// opted in. A trigger that requests a provider the router did not register
+	// gets no route object (and, in a later phase, a status Condition).
+	providers, err := buildRouteProviders(logger, kubeClient, restConfig)
+	if err != nil {
+		return fmt.Errorf("error building route providers: %w", err)
+	}
+
+	// Register the trigger + function reconcilers. Each signals a debounced mux
+	// rebuild; GenerationChangedPredicate drops status-only writes so the
+	// router's own HTTPTrigger condition writes don't loop.
+	if err := controller.Register(crMgr, &fv1.HTTPTrigger{},
+		&httpTriggerReconciler{logger: logger.WithName("httptrigger_reconciler"), client: crMgr.GetClient(), ts: triggers, providers: providers},
+		"router-httptrigger"); err != nil {
+		return fmt.Errorf("error registering httptrigger reconciler: %w", err)
+	}
+	if err := controller.Register(crMgr, &fv1.Function{},
+		&functionReconciler{logger: logger.WithName("function_reconciler"), client: crMgr.GetClient(), ts: triggers},
+		"router-function"); err != nil {
+		return fmt.Errorf("error registering function reconciler: %w", err)
+	}
 
 	logger.Info("starting router", "port", port, "internalPort", internalPort)
 
-	tracer := otel.Tracer("router")
-	ctx, span := tracer.Start(ctx, "router/Start")
-	defer span.End()
+	// The public/internal listeners run on an internal GroupManager, hosted by a
+	// single Manager runnable.
+	err = crMgr.Add(runnableFunc(func(rctx context.Context) error {
+		gm := &errgroup.Group{}
+		tracer := otel.Tracer("router")
+		rctx, span := tracer.Start(rctx, "router/serve")
+		defer span.End()
+		if err := serve(rctx, logger, gm, port, internalPort, triggers); err != nil {
+			return err
+		}
+		// Kick the initial mux build once the cache has synced, so router-owned
+		// routes (healthz/version/auth) are installed even with zero triggers.
+		// The reconcilers also fire for every existing object; the debouncer
+		// coalesces these into a single rebuild.
+		if crMgr.GetCache().WaitForCacheSync(rctx) {
+			triggers.syncTriggers()
+		}
+		<-rctx.Done()
+		_ = gm.Wait()
+		return nil
+	}))
+	if err != nil {
+		return fmt.Errorf("unable to add router runnable: %w", err)
+	}
 
-	return serve(ctx, logger, mgr, port, internalPort, triggers)
+	return crMgr.Start(ctx)
 }

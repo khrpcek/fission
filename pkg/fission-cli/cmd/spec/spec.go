@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package spec
 
@@ -35,6 +23,7 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/cmd"
 	"github.com/fission/fission/pkg/fission-cli/cmd/spec/types"
 	"github.com/fission/fission/pkg/fission-cli/console"
+	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
 	"github.com/fission/fission/pkg/fission-cli/util"
 )
 
@@ -212,6 +201,49 @@ func SpecDry(resource any) error {
 	}
 	fmt.Println(string(data))
 	return nil
+}
+
+// CheckFunctionReferencesInSpecs warns for every function name a trigger
+// references that is not present in the spec directory. It is the shared
+// --spec-save validation used by the trigger create commands (referrerKind is
+// e.g. "HTTPTrigger", referrerName the trigger name).
+func CheckFunctionReferencesInSpecs(input cli.Input, referrerKind, referrerName string, fnNames []string, namespace string) error {
+	specDir := util.GetSpecDir(input)
+	fr, err := ReadSpecs(specDir, util.GetSpecIgnore(input), false)
+	if err != nil {
+		return fmt.Errorf("error reading spec in '%v': %w", specDir, err)
+	}
+	for _, fn := range fnNames {
+		exists, err := fr.ExistsInSpecs(fv1.Function{
+			ObjectMeta: metav1.ObjectMeta{Name: fn, Namespace: namespace},
+		})
+		if err != nil {
+			return err
+		}
+		if !exists {
+			console.Warn(fmt.Sprintf("%s '%v' references unknown Function '%v', please create it before applying spec",
+				referrerKind, referrerName, fn))
+		}
+	}
+	return nil
+}
+
+// SaveOrDry handles the shared --spec-dry / --spec-save behaviour used by the
+// resource create commands. When --spec-dry is set it prints the resource YAML;
+// when --spec-save is set it writes it to specFile. It returns handled=true when
+// either flag was set, in which case the caller must return err immediately
+// instead of talking to the API server.
+func SaveOrDry(input cli.Input, resource any, specFile string) (handled bool, err error) {
+	if input.Bool(flagkey.SpecDry) {
+		return true, SpecDry(resource)
+	}
+	if input.Bool(flagkey.SpecSave) {
+		if err := SpecSave(resource, specFile, false); err != nil {
+			return true, fmt.Errorf("error saving spec to %s: %w", specFile, err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func crdToYaml(resource any) (metav1.ObjectMeta, string, []byte, error) {
@@ -514,147 +546,115 @@ func (fr *FissionResources) Validate(input cli.Input, client cmd.Client) ([]stri
 }
 
 // Keep track of source location of resources, and track duplicates
-func (fr *FissionResources) trackSourceMap(kind string, newobj *metav1.ObjectMeta, loc *Location) error {
+func (fr *FissionResources) trackSourceMap(kind string, obj metav1.Object, loc *Location) error {
+	namespace, name := obj.GetNamespace(), obj.GetName()
 	if _, exists := fr.SourceMap.Locations[kind]; !exists {
 		fr.SourceMap.Locations[kind] = make(map[string](map[string]Location))
 	}
-	if _, exists := fr.SourceMap.Locations[kind][newobj.Namespace]; !exists {
-		fr.SourceMap.Locations[kind][newobj.Namespace] = make(map[string]Location)
+	if _, exists := fr.SourceMap.Locations[kind][namespace]; !exists {
+		fr.SourceMap.Locations[kind][namespace] = make(map[string]Location)
 	}
 
 	// check for duplicate resources
-	oldloc, exists := fr.SourceMap.Locations[kind][newobj.Namespace][newobj.Name]
+	oldloc, exists := fr.SourceMap.Locations[kind][namespace][name]
 	if exists {
-		return fmt.Errorf("%v: Duplicate %v '%v', first defined in %v", loc, kind, newobj.Name, oldloc)
+		return fmt.Errorf("%v: Duplicate %v '%v', first defined in %v", loc, kind, name, oldloc)
 	}
 
 	// track new resource
-	fr.SourceMap.Locations[kind][newobj.Namespace][newobj.Name] = *loc
+	fr.SourceMap.Locations[kind][namespace][name] = *loc
 
 	return nil
 }
 
 // Apply commit label to the object metadata
-func applyCommitLabel(commitLabelVal string, m *metav1.ObjectMeta) {
+func applyCommitLabel(commitLabelVal string, o metav1.Object) {
 	if len(commitLabelVal) != 0 {
-		if m.Labels == nil {
-			m.Labels = make(map[string]string)
+		labels := o.GetLabels()
+		if labels == nil {
+			labels = make(map[string]string)
 		}
-		m.Labels[util.COMMIT_LABEL] = commitLabelVal
+		labels[util.COMMIT_LABEL] = commitLabelVal
+		o.SetLabels(labels)
 	}
+}
+
+// parseResource unmarshals one CRD YAML document into a value of type T, stamps
+// the commit label, appends it to the matching FissionResources slice, and
+// returns the parsed object so the caller can record it in the source map. It
+// collapses the otherwise-identical per-kind arms of ParseYaml.
+func parseResource[T any, PT Object[T]](b []byte, kind string, loc *Location, commitLabelVal string, dst *[]T) (metav1.Object, error) {
+	var v T
+	if err := yaml.Unmarshal(b, &v); err != nil {
+		return nil, fmt.Errorf("failed to parse %v in %v: %w", kind, loc, err)
+	}
+	obj := PT(&v)
+	applyCommitLabel(commitLabelVal, obj)
+	*dst = append(*dst, v)
+	return obj, nil
 }
 
 // ParseYaml takes one yaml document, figures out its type, parses it, and puts it in
 // the right list in the given fission resources set.
 func (fr *FissionResources) ParseYaml(b []byte, loc *Location, commitLabelVal string) error {
-	var m *metav1.ObjectMeta
-
 	// Figure out the object type by unmarshaling into the TypeMeta struct; then
 	// unmarshal again into the "real" struct once we know the type.
 	var tm types.TypeMeta
-	err := yaml.Unmarshal(b, &tm)
-	if err != nil {
+	if err := yaml.Unmarshal(b, &tm); err != nil {
 		return fmt.Errorf("failed to decode yaml %s: %w", string(b), err)
 	}
 
+	// obj is the parsed resource to record in the source map (nil for kinds we
+	// don't track, such as DeploymentConfig and unknown kinds).
+	var obj metav1.Object
+	var err error
+
 	switch tm.Kind {
 	case "Package":
-		var v fv1.Package
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.Packages = append(fr.Packages, v)
+		obj, err = parseResource[fv1.Package](b, tm.Kind, loc, commitLabelVal, &fr.Packages)
 	case "Function":
-		var v fv1.Function
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.Functions = append(fr.Functions, v)
+		obj, err = parseResource[fv1.Function](b, tm.Kind, loc, commitLabelVal, &fr.Functions)
 	case "Environment":
-		var v fv1.Environment
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.Environments = append(fr.Environments, v)
+		obj, err = parseResource[fv1.Environment](b, tm.Kind, loc, commitLabelVal, &fr.Environments)
 	case "HTTPTrigger":
-		var v fv1.HTTPTrigger
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.HttpTriggers = append(fr.HttpTriggers, v)
+		obj, err = parseResource[fv1.HTTPTrigger](b, tm.Kind, loc, commitLabelVal, &fr.HttpTriggers)
 	case "KubernetesWatchTrigger":
-		var v fv1.KubernetesWatchTrigger
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.KubernetesWatchTriggers = append(fr.KubernetesWatchTriggers, v)
+		obj, err = parseResource[fv1.KubernetesWatchTrigger](b, tm.Kind, loc, commitLabelVal, &fr.KubernetesWatchTriggers)
 	case "TimeTrigger":
-		var v fv1.TimeTrigger
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.TimeTriggers = append(fr.TimeTriggers, v)
+		obj, err = parseResource[fv1.TimeTrigger](b, tm.Kind, loc, commitLabelVal, &fr.TimeTriggers)
 	case "MessageQueueTrigger":
-		var v fv1.MessageQueueTrigger
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
-			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
-		}
-		m = &v.ObjectMeta
-		applyCommitLabel(commitLabelVal, m)
-		fr.MessageQueueTriggers = append(fr.MessageQueueTriggers, v)
+		obj, err = parseResource[fv1.MessageQueueTrigger](b, tm.Kind, loc, commitLabelVal, &fr.MessageQueueTriggers)
 
-	// The following are not CRDs
+	// The following are not CRDs.
 
 	case "DeploymentConfig":
 		var v types.DeploymentConfig
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
+		if err = yaml.Unmarshal(b, &v); err != nil {
 			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
 		}
-
 		fr.DeploymentConfig = v
 	case "ArchiveUploadSpec":
 		var v types.ArchiveUploadSpec
-		err = yaml.Unmarshal(b, &v)
-		if err != nil {
+		if err = yaml.Unmarshal(b, &v); err != nil {
 			return fmt.Errorf("failed to parse %v in %v: %w", tm.Kind, loc, err)
 		}
-
-		m = &metav1.ObjectMeta{
-			Name:      v.Name,
-			Namespace: "",
-		}
+		m := &metav1.ObjectMeta{Name: v.Name, Namespace: ""}
 		applyCommitLabel(commitLabelVal, m)
 		fr.ArchiveUploadSpecs = append(fr.ArchiveUploadSpecs, v)
+		obj = m
 	default:
 		// no need to error out just because there's some extra files around;
 		// also good for compatibility.
 		console.Warn(fmt.Sprintf("Ignoring unknown type %v in %v", tm.Kind, loc))
 	}
 
+	if err != nil {
+		return err
+	}
+
 	// add to source map, check for duplicates
-	if m != nil {
-		err = fr.trackSourceMap(tm.Kind, m, loc)
-		if err != nil {
+	if obj != nil {
+		if err := fr.trackSourceMap(tm.Kind, obj, loc); err != nil {
 			return err
 		}
 	}

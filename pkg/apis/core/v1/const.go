@@ -1,28 +1,21 @@
-/*
-Copyright 2018 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package v1
 
 var (
-	MinimumKubernetesVersion = [3]int{1, 19, 0}
+	MinimumKubernetesVersion = [3]int{1, 32, 0}
 )
 
 const (
 	EXECUTOR_INSTANCEID_LABEL string = "executorInstanceId"
 	DEFAULT_FUNCTION_TIMEOUT  int    = 60
+
+	// DefaultStreamIdleSeconds is the idle timeout applied to a streaming function
+	// when StreamingConfig.IdleTimeoutSeconds is unset. Overridable cluster-wide via
+	// the router's ROUTER_STREAM_IDLE_TIMEOUT env.
+	DefaultStreamIdleSeconds int = 60
 )
 
 const (
@@ -41,6 +34,10 @@ const (
 
 	// ArchiveTypeUrl means the package contents are at the specified URL.
 	ArchiveTypeUrl ArchiveType = "url"
+
+	// ArchiveTypeOCI means the package contents are the filesystem of an
+	// OCI image referenced in the OCI field of the resource.
+	ArchiveTypeOCI ArchiveType = "oci"
 )
 
 const (
@@ -54,6 +51,15 @@ const (
 const (
 	AllowedFunctionsPerContainerSingle   = "single"
 	AllowedFunctionsPerContainerInfinite = "infinite"
+)
+
+const (
+	// StreamingAuto flushes immediately and lets the upstream decide the framing
+	// (SSE, chunked, or a WebSocket Upgrade); the safe default.
+	StreamingAuto      StreamingProtocol = "auto"
+	StreamingSSE       StreamingProtocol = "sse"
+	StreamingChunked   StreamingProtocol = "chunked"
+	StreamingWebSocket StreamingProtocol = "websocket"
 )
 
 const (
@@ -133,6 +139,42 @@ const (
 	FUNCTION_RESOURCE_VERSION = "functionResourceVersion"
 	EXECUTOR_TYPE             = "executorType"
 	MANAGED                   = "managed"
+	// POOL_OCI_IMAGE_HASH marks pool pods whose userfunc volume is an OCI
+	// image volume (RFC-0001 Path B). Pools are keyed per (env UID, image
+	// hash); the pod reconciler routes warm pods on this label. Absent on
+	// pods of plain (fetcher-based) pools.
+	POOL_OCI_IMAGE_HASH = "ociImageHash"
+
+	// RFC-0002 EndpointSlice-native data plane labels.
+	//
+	// FUNCTION_GENERATION labels a specialized pool pod with the Function
+	// generation it was specialized from. The per-function Service selector
+	// includes it so stale-generation pods drop out of the EndpointSlices on a
+	// function update (the executor-side equivalent is CacheKeyURG keying).
+	FUNCTION_GENERATION = "fission.io/function-generation"
+	// SERVED_LABEL gates a specialized pod's membership in its function
+	// Service: pool pods pass readiness probes before specialization, so the
+	// label is set only by the post-specialization patch — without it the
+	// EndpointSlice controller would publish a relabeled-but-unspecialized pod
+	// as a ready endpoint.
+	SERVED_LABEL = "fission.io/served"
+	// SERVED_VALUE is SERVED_LABEL's only valid value. The Service selector
+	// (gp_service.go) and the post-specialize pod patch (gp.go) live in
+	// different files and MUST agree byte-for-byte — drift means specialized
+	// pods silently never join their Service.
+	SERVED_VALUE = "true"
+	// MANAGED_BY_LABEL marks the Services Fission's data plane owns; the
+	// EndpointSlice controller mirrors Service labels onto slices, and the
+	// router's slice informer filters on it.
+	MANAGED_BY_LABEL = "fission.io/managed-by"
+	MANAGED_BY_VALUE = "fission"
+
+	// ConcurrencyEnforcementAnnotation opts a Function out of router-local
+	// admission (RFC-0002): with the value "strict" every request goes through
+	// the executor's PoolCache exactly as before the EndpointSlice data plane.
+	// See Function.StrictConcurrencyEnforcement.
+	ConcurrencyEnforcementAnnotation = "fission.io/concurrency-enforcement"
+	ConcurrencyEnforcementStrict     = "strict"
 )
 
 const (

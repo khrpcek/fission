@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package utils
 
@@ -26,6 +14,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 )
@@ -261,4 +252,59 @@ func TestDownloadUrl_OverwriteAllowed(t *testing.T) {
 	if mode := fi.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("mode after overwrite: got %#o, want 0600", mode)
 	}
+}
+
+func TestDownloadUrlToRoot_ConfinesToBase(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("payload"))
+	}))
+	t.Cleanup(srv.Close)
+
+	base := t.TempDir()
+
+	// Happy path: writes under base with mode 0600.
+	dst := filepath.Join(base, "out.bin")
+	if err := DownloadUrlToRoot(context.Background(), srv.Client(), srv.URL, base, dst); err != nil {
+		t.Fatalf("DownloadUrlToRoot: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != "payload" {
+		t.Fatalf("expected payload, got %q (err=%v)", got, err)
+	}
+	fi, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if mode := fi.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("mode: got %#o, want 0600", mode)
+	}
+
+	// A path escaping base is rejected and nothing is written outside base.
+	sentinel := filepath.Join(filepath.Dir(base), "sentinel.bin")
+	if err := os.WriteFile(sentinel, []byte("intact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := DownloadUrlToRoot(context.Background(), srv.Client(), srv.URL, base, "../sentinel.bin"); err == nil {
+		t.Fatal("expected error for path escaping base")
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "intact" {
+		t.Fatalf("sentinel was modified: %q (err=%v)", got, err)
+	}
+}
+
+func TestRootFileChecksum_ConfinesToBase(t *testing.T) {
+	base := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(base, "data.bin"), []byte("checksum me"), 0o600))
+
+	sum, err := RootFileChecksum(base, "data.bin")
+	require.NoError(t, err)
+	require.NotNil(t, sum)
+
+	want, err := GetFileChecksum(filepath.Join(base, "data.bin"))
+	require.NoError(t, err)
+	assert.Equal(t, want.Sum, sum.Sum)
+
+	// A path escaping base is rejected.
+	_, err = RootFileChecksum(base, "../../etc/hostname")
+	assert.Error(t, err)
 }

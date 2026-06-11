@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package mqtrigger
 
@@ -52,7 +40,7 @@ func (opts *UpdateSubCommand) do(input cli.Input) error {
 func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 	_, namespace, err := opts.GetResourceNamespace(input, flagkey.NamespaceTrigger)
 	if err != nil {
-		return fmt.Errorf("error in deleting function : %w", err)
+		return fmt.Errorf("error in updating message queue trigger : %w", err)
 	}
 
 	mqt, err := opts.Client().FissionClientSet.CoreV1().MessageQueueTriggers(namespace).Get(input.Context(), input.String(flagkey.MqtName), metav1.GetOptions{})

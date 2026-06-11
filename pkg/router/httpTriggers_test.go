@@ -1,12 +1,6 @@
-/*
-Copyright 2026 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package router
 
@@ -48,7 +42,6 @@ func newTestTriggerSet(t *testing.T, functions []fv1.Function, triggers []fv1.HT
 	logger := loggerfactory.GetLogger()
 	ts := &HTTPTriggerSet{
 		logger:                     logger.WithName("test_trigger_set"),
-		functionServiceMap:         makeFunctionServiceMap(logger, time.Minute),
 		triggers:                   triggers,
 		functions:                  functions,
 		updateRouterRequestChannel: make(chan struct{}, 1),
@@ -76,7 +69,7 @@ func TestPublicMuxDoesNotRegisterInternalFunctionRoute(t *testing.T) {
 	}
 	ts := newTestTriggerSet(t, []fv1.Function{fn}, nil)
 
-	publicMux, internalMux, err := ts.buildMuxes(nil)
+	publicMux, internalMux, err := ts.buildMuxes(t.Context(), nil)
 	require.NoError(t, err)
 
 	// Public mux must NOT have the internal-only route.
@@ -107,7 +100,7 @@ func TestPublicMuxDoesNotRegisterInternalFunctionRoute(t *testing.T) {
 func TestPublicMuxStillServesHealthAndVersion(t *testing.T) {
 	ts := newTestTriggerSet(t, nil, nil)
 
-	publicMux, internalMux, err := ts.buildMuxes(nil)
+	publicMux, internalMux, err := ts.buildMuxes(t.Context(), nil)
 	require.NoError(t, err)
 
 	rr := httptest.NewRecorder()
@@ -145,7 +138,7 @@ func TestInternalListenerRejectsUnsignedRequests(t *testing.T) {
 	}
 	ts := newTestTriggerSet(t, []fv1.Function{fn}, nil)
 
-	_, internalMux, err := ts.buildMuxes(nil)
+	_, internalMux, err := ts.buildMuxes(t.Context(), nil)
 	require.NoError(t, err)
 
 	// Mirror the production wiring: ServiceVerifier with ServiceRouterInternal
@@ -207,7 +200,7 @@ func TestInternalListenerPassThroughWithEmptySecret(t *testing.T) {
 // router.go's wrap surfaces here.
 func TestPublicListener_SecurityHeadersPresentOnRouterOwnedRoutes(t *testing.T) {
 	ts := newTestTriggerSet(t, nil, nil)
-	publicMux, _, err := ts.buildMuxes(nil)
+	publicMux, _, err := ts.buildMuxes(t.Context(), nil)
 	require.NoError(t, err)
 	wrapped := httpsecurity.SecurityHeaders(publicMux)
 
@@ -225,7 +218,7 @@ func TestPublicListener_SecurityHeadersPresentOnRouterOwnedRoutes(t *testing.T) 
 // preflight to the wrapped DenyAllCORS handler, which returns 403.
 func TestPublicListener_RouterOwnedRoutesRejectCrossOriginPreflight(t *testing.T) {
 	ts := newTestTriggerSet(t, nil, nil)
-	publicMux, _, err := ts.buildMuxes(nil)
+	publicMux, _, err := ts.buildMuxes(t.Context(), nil)
 	require.NoError(t, err)
 
 	for _, path := range []string{"/router-healthz", "/_version", "/"} {
@@ -295,7 +288,7 @@ func TestInternalListener_RejectsCrossOriginPreflight(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "myns"},
 	}
 	ts := newTestTriggerSet(t, []fv1.Function{fn}, nil)
-	_, internalMux, err := ts.buildMuxes(nil)
+	_, internalMux, err := ts.buildMuxes(t.Context(), nil)
 	require.NoError(t, err)
 
 	// Mirror the production wrap chain from router.go:Start: HMAC

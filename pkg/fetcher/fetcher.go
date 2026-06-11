@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package fetcher
 
@@ -189,11 +177,17 @@ func verifyChecksum(fileChecksum, checksum *fv1.Checksum) error {
 }
 
 func writeSecretOrConfigMap(dataMap map[string][]byte, dirPath string) error {
+	// Open the os.Root once and write every key through it: os.Root confines
+	// each write to dirPath (the keys are Secret/ConfigMap data keys), and
+	// reusing one root avoids an openat per key.
+	root, err := os.OpenRoot(dirPath)
+	if err != nil {
+		return fmt.Errorf("failed to open directory %s: %w", dirPath, err)
+	}
+	defer root.Close()
 	for key, val := range dataMap {
-		writeFilePath := filepath.Join(dirPath, key)
-		err := os.WriteFile(writeFilePath, val, 0750)
-		if err != nil {
-			return fmt.Errorf("failed to write file %s: %w", writeFilePath, err)
+		if err := root.WriteFile(key, val, 0750); err != nil {
+			return fmt.Errorf("failed to write file %s in %s: %w", key, dirPath, err)
 		}
 	}
 	return nil
@@ -305,14 +299,14 @@ func (fetcher *Fetcher) SpecializeHandler(w http.ResponseWriter, r *http.Request
 func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req FunctionFetchRequest) (int, error) {
 	logger := otelUtils.LoggerWithTraceID(ctx, fetcher.logger)
 
-	storePath, err := utils.SanitizeFilePath(filepath.Join(fetcher.sharedVolumePath, req.Filename), fetcher.sharedVolumePath)
+	storePath, err := utils.RootJoin(fetcher.sharedVolumePath, req.Filename)
 	if err != nil {
 		logger.Error(err, "filename", req.Filename)
 		return http.StatusBadRequest, fmt.Errorf("%s, request: %v", err, req)
 	}
 
 	// verify first if the file already exists.
-	if _, err := os.Stat(storePath); err == nil {
+	if _, err := utils.RootStat(fetcher.sharedVolumePath, storePath); err == nil {
 		logger.Info("requested file already exists at shared volume - skipping fetch",
 			"requested_file", req.Filename,
 			"shared_volume_path", fetcher.sharedVolumePath)
@@ -320,7 +314,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 		return http.StatusOK, nil
 	}
 
-	tmpPath, err := utils.SanitizeFilePath(storePath+".tmp", fetcher.sharedVolumePath)
+	tmpPath, err := utils.RootJoin(fetcher.sharedVolumePath, storePath+".tmp")
 	if err != nil {
 		logger.Error(err, "filename", req.Filename)
 		return http.StatusBadRequest, fmt.Errorf("%s, request: %v", err, req)
@@ -335,7 +329,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 		// fetch the file and save it to the tmp path. FETCH_URL targets
 		// are user-supplied — pick the unsigned client unless the URL
 		// happens to point at our own storagesvc.
-		err := utils.DownloadUrl(ctx, fetcher.httpClientForURL(req.URL), req.URL, tmpPath)
+		err := utils.DownloadUrlToRoot(ctx, fetcher.httpClientForURL(req.URL), req.URL, fetcher.sharedVolumePath, tmpPath)
 		if err != nil {
 			e := "failed to download url from fetch request"
 			logger.Error(err, e, "url", req.URL)
@@ -364,10 +358,16 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 			return http.StatusBadRequest, fmt.Errorf("unknown fetch type: %v", req.FetchType)
 		}
 
+		// OCI archives (RFC-0001) have their own pull/extract path; the
+		// literal/url/zip handling below is tarball-specific.
+		if archive.OCI != nil {
+			return fetcher.fetchOCI(ctx, pkg, archive.OCI, storePath)
+		}
+
 		// get package data as literal or by url
 		if len(archive.Literal) > 0 {
 			// write pkg.Literal into tmpPath
-			err := os.WriteFile(tmpPath, archive.Literal, 0600)
+			err := utils.RootWriteFile(fetcher.sharedVolumePath, tmpPath, archive.Literal, 0600)
 			if err != nil {
 				e := "failed to write file"
 				logger.Error(err, e, "location", tmpPath)
@@ -384,7 +384,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 			// archive.URL may resolve to storagesvc (/v1/archive?id=...)
 			// or an external storage backend (S3, GCS, etc.). Sign only
 			// when the URL targets storagesvc.
-			err := utils.DownloadUrl(ctx, fetcher.httpClientForURL(archive.URL), archive.URL, tmpPath)
+			err := utils.DownloadUrlToRoot(ctx, fetcher.httpClientForURL(archive.URL), archive.URL, fetcher.sharedVolumePath, tmpPath)
 			if err != nil {
 				e := "failed to download url from archive"
 				logger.Error(err, e, "url", req.URL)
@@ -393,7 +393,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 
 			// check file integrity only if checksum is not empty.
 			if len(archive.Checksum.Sum) > 0 {
-				checksum, err := utils.GetFileChecksum(tmpPath)
+				checksum, err := utils.RootFileChecksum(fetcher.sharedVolumePath, tmpPath)
 				if err != nil {
 					e := "failed to get checksum"
 					logger.Error(err, e)
@@ -410,10 +410,10 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 	}
 
 	// checking if file is a zip
-	if match, _ := utils.IsZip(ctx, tmpPath); match && !req.KeepArchive {
+	if match, _ := utils.IsZipInRoot(ctx, fetcher.sharedVolumePath, tmpPath); match && !req.KeepArchive {
 		// unarchive tmp file to a tmp unarchive path
 		tmpUnarchivePath := filepath.Join(fetcher.sharedVolumePath, uuid.NewString())
-		err := utils.Unarchive(ctx, tmpPath, tmpUnarchivePath)
+		err := utils.UnarchiveInRoot(ctx, fetcher.sharedVolumePath, tmpPath, tmpUnarchivePath)
 		if err != nil {
 			logger.Error(err, "error unarchive", "archive_location", tmpPath,
 				"target_location", tmpUnarchivePath)
@@ -459,13 +459,13 @@ func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv
 				return httpCode, errors.New(e)
 			}
 
-			secretDir, err := utils.SanitizeFilePath(filepath.Join(fetcher.sharedSecretPath, secret.Namespace, secret.Name), fetcher.sharedSecretPath)
+			secretDir, err := utils.RootJoin(fetcher.sharedSecretPath, filepath.Join(secret.Namespace, secret.Name))
 			if err != nil {
 				logger.Error(err, "directory", secretDir, "secret_name", secret.Name, "secret_namespace", secret.Namespace)
 				return http.StatusBadRequest, fmt.Errorf("%s, request: %v", err, secret)
 			}
 
-			err = os.MkdirAll(secretDir, os.ModeDir|0750)
+			err = utils.RootMkdirAll(fetcher.sharedSecretPath, secretDir, 0750)
 			if err != nil {
 				e := "failed to create directory for secret"
 				logger.Error(err, e, "directory", secretDir,
@@ -505,14 +505,14 @@ func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv
 				return httpCode, errors.New(e)
 			}
 
-			configDir, err := utils.SanitizeFilePath(filepath.Join(fetcher.sharedConfigPath, config.Namespace, config.Name), fetcher.sharedConfigPath)
+			configDir, err := utils.RootJoin(fetcher.sharedConfigPath, filepath.Join(config.Namespace, config.Name))
 			if err != nil {
 				logger.Error(err, "directory", configDir, "config_map_name", config.Name, "config_map_namespace", config.Namespace)
 				return http.StatusBadRequest, fmt.Errorf("%s, request: %v", err,
 					config)
 			}
 
-			err = os.MkdirAll(configDir, os.ModeDir|0750)
+			err = utils.RootMkdirAll(fetcher.sharedConfigPath, configDir, 0750)
 			if err != nil {
 				e := "failed to create directory for configmap"
 				logger.Error(err, e, "directory", configDir,
@@ -574,13 +574,13 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("fetcher received upload request", "request", req)
 
-	srcFilepath, err := utils.SanitizeFilePath(filepath.Join(fetcher.sharedVolumePath, req.Filename), fetcher.sharedVolumePath)
+	srcFilepath, err := utils.RootJoin(fetcher.sharedVolumePath, req.Filename)
 	if err != nil {
 		logger.Error(err, "error sanitizing file path")
 		http.Error(w, fmt.Sprintf("%s: %v", err, req.Filename), http.StatusBadRequest)
 		return
 	}
-	dstFilepath, err := utils.SanitizeFilePath(filepath.Join(fetcher.sharedVolumePath, req.Filename+".zip"), fetcher.sharedVolumePath)
+	dstFilepath, err := utils.RootJoin(fetcher.sharedVolumePath, req.Filename+".zip")
 	if err != nil {
 		logger.Error(err, "error sanitizing file path")
 		http.Error(w, fmt.Sprintf("%s: %v", err, req.Filename), http.StatusBadRequest)
@@ -596,7 +596,7 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if req.ArchivePackage {
-		err = utils.Archive(ctx, srcFilepath, dstFilepath)
+		err = utils.ArchiveInRoot(ctx, fetcher.sharedVolumePath, srcFilepath, dstFilepath)
 		if err != nil {
 			e := "error archiving zip file"
 			logger.Error(err, e, "source", srcFilepath, "destination", dstFilepath)
@@ -604,7 +604,7 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		err = os.Rename(srcFilepath, dstFilepath)
+		err = utils.RootRename(fetcher.sharedVolumePath, srcFilepath, dstFilepath)
 		if err != nil {
 			e := "error renaming the archive"
 			logger.Error(err, e, "source", srcFilepath, "destination", dstFilepath)
@@ -616,7 +616,26 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 	logger.Info("starting upload...")
 	ssClient := storageSvcClient.MakeClient(req.StorageSvcUrl, storageSvcClient.HMACSecretFromEnv())
 
-	fileID, err := ssClient.Upload(ctx, dstFilepath, nil)
+	// Open the archive once through an os.Root rooted at the shared volume so
+	// the request-derived path cannot escape it (CWE-22), then hand the open
+	// file to the storage client.
+	uploadFile, err := utils.RootOpen(fetcher.sharedVolumePath, dstFilepath)
+	if err != nil {
+		e := "error opening zip file for upload"
+		logger.Error(err, e, "file", dstFilepath)
+		http.Error(w, fmt.Sprintf("%s: %v", e, err), http.StatusInternalServerError)
+		return
+	}
+	uploadInfo, err := uploadFile.Stat()
+	if err != nil {
+		uploadFile.Close()
+		e := "error stating zip file for upload"
+		logger.Error(err, e, "file", dstFilepath)
+		http.Error(w, fmt.Sprintf("%s: %v", e, err), http.StatusInternalServerError)
+		return
+	}
+	fileID, err := ssClient.UploadReader(ctx, dstFilepath, uploadFile, uploadInfo.Size(), nil)
+	uploadFile.Close()
 	if err != nil {
 		e := "error uploading zip file"
 		logger.Error(err, e, "file", dstFilepath)
@@ -624,7 +643,7 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sum, err := utils.GetFileChecksum(dstFilepath)
+	sum, err := utils.RootFileChecksum(fetcher.sharedVolumePath, dstFilepath)
 	if err != nil {
 		e := "error calculating checksum of zip file"
 		logger.Error(err, e, "file", dstFilepath)
@@ -658,7 +677,8 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (fetcher *Fetcher) rename(src string, dst string) error {
-	err := os.Rename(src, dst)
+	// src and dst are always under the shared volume; confine the rename to it.
+	err := utils.RootRename(fetcher.sharedVolumePath, src, dst)
 	if err != nil {
 		return fmt.Errorf("failed to move file: %w", err)
 	}

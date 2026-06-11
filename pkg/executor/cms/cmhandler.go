@@ -1,31 +1,15 @@
-/*
-Copyright 2021 The Fission Authors.
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package cms
 
 import (
 	"context"
 
-	"github.com/go-logr/logr"
-	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	k8sCache "k8s.io/client-go/tools/cache"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
-	"github.com/fission/fission/pkg/executor/executortype"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
 )
 
@@ -46,32 +30,4 @@ func getConfigmapRelatedFuncs(ctx context.Context, m *metav1.ObjectMeta, fission
 		}
 	}
 	return relatedFunctions, nil
-}
-
-func ConfigMapEventHandlers(ctx context.Context, logger logr.Logger, fissionClient versioned.Interface,
-	kubernetesClient kubernetes.Interface, types map[fv1.ExecutorType]executortype.ExecutorType) k8sCache.ResourceEventHandlerFuncs {
-
-	return k8sCache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) {},
-		DeleteFunc: func(obj any) {},
-		UpdateFunc: func(oldObj any, newObj any) {
-			oldCm := oldObj.(*apiv1.ConfigMap)
-			newCm := newObj.(*apiv1.ConfigMap)
-			if oldCm.ResourceVersion != newCm.ResourceVersion {
-				funcs, err := getConfigmapRelatedFuncs(ctx, &newCm.ObjectMeta, fissionClient)
-				if err != nil {
-					logger.Error(err, "Failed to get functions related to configmap", "configmap_name", newCm.Name, "configmap_namespace", newCm.Namespace)
-				}
-
-				if len(funcs) == 0 {
-					return
-				}
-
-				logger.V(1).Info("Configmap changed",
-					"configmap_name", newCm.Name,
-					"configmap_namespace", newCm.Namespace)
-				refreshPods(ctx, logger, funcs, types)
-			}
-		},
-	}
 }

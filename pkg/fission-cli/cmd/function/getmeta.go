@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package function
 
@@ -24,6 +12,7 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/cliwrapper/cli"
 	"github.com/fission/fission/pkg/fission-cli/cmd"
 	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
+	"github.com/fission/fission/pkg/fission-cli/util"
 )
 
 type GetMetaSubCommand struct {
@@ -45,6 +34,14 @@ func (opts *GetMetaSubCommand) do(input cli.Input) error {
 		return fmt.Errorf("error getting function: %w", err)
 	}
 
+	format, err := util.ParseOutputFormat(input.String(flagkey.Output))
+	if err != nil {
+		return err
+	}
+	if handled, err := util.PrintStructured(format, fn); err != nil || handled {
+		return err
+	}
+
 	fmt.Printf("Name: %v\n", fn.Name)
 	fmt.Printf("Environment: %v\n", fn.Spec.Environment.Name)
 	if len(fn.Labels) != 0 {
@@ -59,6 +56,7 @@ func (opts *GetMetaSubCommand) do(input cli.Input) error {
 			fmt.Printf("  %s=%s\n", k, v)
 		}
 	}
+	util.PrintConditions(fn.Status.Conditions)
 
 	return nil
 }

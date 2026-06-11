@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package newdeploy
 
@@ -21,8 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"strconv"
-	"time"
+	"path/filepath"
 
 	appsv1 "k8s.io/api/apps/v1"
 	apiv1 "k8s.io/api/core/v1"
@@ -31,10 +18,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/kubernetes"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/executor/util"
+	"github.com/fission/fission/pkg/utils"
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
@@ -79,14 +66,14 @@ func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Func
 		}
 
 		if *existingDepl.Spec.Replicas < minScale {
-			err = deploy.scaleDeployment(ctx, existingDepl.Namespace, existingDepl.Name, minScale)
+			err = util.ScaleDeployment(ctx, deploy.kubernetesClient, deploy.logger, existingDepl.Namespace, existingDepl.Name, minScale)
 			if err != nil {
 				deploy.logger.Error(err, "error scaling up function deployment", "function", fn.Name)
 				return nil, err
 			}
 		}
 		if existingDepl.Status.AvailableReplicas < minScale {
-			existingDepl, err = deploy.waitForDeploy(ctx, existingDepl, minScale, specializationTimeout)
+			existingDepl, err = util.WaitForDeployment(ctx, deploy.kubernetesClient, deploy.logger, existingDepl, minScale, specializationTimeout)
 		}
 
 		return existingDepl, err
@@ -105,7 +92,7 @@ func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Func
 			}
 		}
 		if minScale > 0 {
-			depl, err = deploy.waitForDeploy(ctx, depl, minScale, specializationTimeout)
+			depl, err = util.WaitForDeployment(ctx, deploy.kubernetesClient, deploy.logger, depl, minScale, specializationTimeout)
 		}
 		return depl, err
 	}
@@ -177,7 +164,7 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 	// rollback, set RevisionHistoryLimit to 0 to disable this feature.
 	revisionHistoryLimit := int32(0)
 
-	rvCount, err := referencedResourcesRVSum(ctx, deploy.kubernetesClient, fn.Namespace, fn.Spec.Secrets, fn.Spec.ConfigMaps)
+	rvCount, err := util.ReferencedResourcesRVSum(ctx, deploy.kubernetesClient, fn.Namespace, fn.Spec.Secrets, fn.Spec.ConfigMaps)
 	if err != nil {
 		return nil, err
 	}
@@ -187,16 +174,8 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		Image:                  env.Spec.Runtime.Image,
 		ImagePullPolicy:        deploy.runtimeImagePullPolicy,
 		TerminationMessagePath: "/dev/termination-log",
-		Lifecycle: &apiv1.Lifecycle{
-			PreStop: &apiv1.LifecycleHandler{
-				Exec: &apiv1.ExecAction{
-					Command: []string{
-						"/bin/sleep",
-						fmt.Sprintf("%d", gracePeriodSeconds),
-					},
-				},
-			},
-		},
+		// Connection-draining preStop hook; see utils.DrainLifecycle.
+		Lifecycle: utils.DrainLifecycle(gracePeriodSeconds),
 		Env: []apiv1.EnvVar{
 			{
 				Name:  fv1.ResourceVersionCount,
@@ -292,13 +271,9 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 	}
 
 	// If custom runtime container name - default env name
-	mainContainerName := env.Name
-	if env.Spec.Runtime.Container != nil && env.Spec.Runtime.Container.Name != "" && env.Spec.Runtime.PodSpec != nil {
-		if util.DoesContainerExistInPodSpec(env.Spec.Runtime.Container.Name, env.Spec.Runtime.PodSpec) {
-			mainContainerName = env.Spec.Runtime.Container.Name
-		} else {
-			return nil, fmt.Errorf("runtime container %s not found in pod spec", env.Spec.Runtime.Container.Name)
-		}
+	mainContainerName, err := deploy.mainContainerName(env)
+	if err != nil {
+		return nil, err
 	}
 
 	// Order of merging is important here - first fetcher, then containers and lastly pod spec
@@ -341,7 +316,44 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		return nil, err
 	}
 
+	// RFC-0001 Path B: mount the package image read-only at the fetcher's
+	// store path on both containers. The fetcher's exists-early-exit then
+	// skips the pull and proceeds straight to secrets + load — Path B for
+	// newdeploy is delivery-only; the stock fetcher flow runs unchanged
+	// (the early-exit makes the fetch a no-op). Applied AFTER every
+	// MergePodSpec (same convention as the SA-token re-clamps) so a runtime
+	// pod spec cannot strip or shadow the code mount.
+	oci, err := deploy.getFunctionOCIArchive(ctx, fn)
+	if err != nil {
+		return nil, err
+	}
+	if oci != nil {
+		if err := util.AddImageVolume(&deployment.Spec.Template.Spec, oci,
+			filepath.Join(deploy.fetcherConfig.SharedMountPath(), deploy.fetcherConfig.TargetFilename(fn, env)),
+			mainContainerName, util.FetcherContainerName); err != nil {
+			return nil, err
+		}
+	}
+
 	return deployment, nil
+}
+
+// mainContainerName resolves the name of the function's main (user-code)
+// container in the deployment's pod spec. It defaults to the environment name
+// and switches to the custom runtime container name when the environment
+// declares one that is actually present in the runtime PodSpec. It is shared by
+// the deployment-spec builder and the HPA call site so the ContainerResource
+// metric can never name a container that differs from the one in the pod.
+func (deploy *NewDeploy) mainContainerName(env *fv1.Environment) (string, error) {
+	mainContainerName := env.Name
+	if env.Spec.Runtime.Container != nil && env.Spec.Runtime.Container.Name != "" && env.Spec.Runtime.PodSpec != nil {
+		if util.DoesContainerExistInPodSpec(env.Spec.Runtime.Container.Name, env.Spec.Runtime.PodSpec) {
+			mainContainerName = env.Spec.Runtime.Container.Name
+		} else {
+			return "", fmt.Errorf("runtime container %s not found in pod spec", env.Spec.Runtime.Container.Name)
+		}
+	}
+	return mainContainerName, nil
 }
 
 // getResources overrides only the resources which are overridden at function level otherwise
@@ -391,10 +403,17 @@ func (deploy *NewDeploy) createOrGetSvc(ctx context.Context, fn *fv1.Function, d
 		}
 	}
 
+	// The Service carries the managed-by label (RFC-0002) so the EndpointSlice
+	// controller mirrors it onto the slices and the router's label-filtered
+	// informer sees them. Labels only — the selector stays deployLabels.
+	svcLabels := make(map[string]string, len(deployLabels)+1)
+	maps.Copy(svcLabels, deployLabels)
+	svcLabels[fv1.MANAGED_BY_LABEL] = fv1.MANAGED_BY_VALUE
+
 	service := &apiv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            svcName,
-			Labels:          deployLabels,
+			Labels:          svcLabels,
 			Annotations:     deployAnnotations,
 			OwnerReferences: ownerReferences,
 		},
@@ -414,8 +433,10 @@ func (deploy *NewDeploy) createOrGetSvc(ctx context.Context, fn *fv1.Function, d
 
 	existingSvc, err := deploy.kubernetesClient.CoreV1().Services(svcNamespace).Get(ctx, svcName, metav1.GetOptions{})
 	if err == nil {
-		// to adopt orphan service
-		if existingSvc.Annotations[fv1.EXECUTOR_INSTANCEID_LABEL] != deploy.instanceID {
+		// to adopt orphan service (the managed-by check upgrades Services
+		// created before RFC-0002 so their slices become router-visible)
+		if existingSvc.Annotations[fv1.EXECUTOR_INSTANCEID_LABEL] != deploy.instanceID ||
+			existingSvc.Labels[fv1.MANAGED_BY_LABEL] != fv1.MANAGED_BY_VALUE {
 			existingSvc.Annotations = service.Annotations
 			existingSvc.Labels = service.Labels
 			existingSvc.OwnerReferences = service.OwnerReferences
@@ -450,39 +471,6 @@ func (deploy *NewDeploy) deleteSvc(ctx context.Context, ns string, name string) 
 	return deploy.kubernetesClient.CoreV1().Services(ns).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
-func (deploy *NewDeploy) waitForDeploy(ctx context.Context, depl *appsv1.Deployment, replicas int32, specializationTimeout int) (latestDepl *appsv1.Deployment, err error) {
-	oldStatus := depl.Status
-	otelUtils.SpanTrackEvent(ctx, "waitingForDeployment", otelUtils.GetAttributesForDeployment(depl)...)
-	// if no specializationTimeout is set, use default value
-	if specializationTimeout < fv1.DefaultSpecializationTimeOut {
-		specializationTimeout = fv1.DefaultSpecializationTimeOut
-	}
-
-	logger := otelUtils.LoggerWithTraceID(ctx, deploy.logger)
-
-	for i := 0; i < specializationTimeout; i++ {
-		latestDepl, err = deploy.kubernetesClient.AppsV1().Deployments(depl.ObjectMeta.Namespace).Get(ctx, depl.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-		// TODO check for imagePullerror
-		// use AvailableReplicas here is better than ReadyReplicas
-		// since the pods may not be able to serve network traffic yet.
-		if latestDepl.Status.AvailableReplicas >= replicas {
-			otelUtils.SpanTrackEvent(ctx, "deploymentAvailable", otelUtils.GetAttributesForDeployment(latestDepl)...)
-			return latestDepl, err
-		}
-		time.Sleep(time.Second)
-	}
-
-	logger.Error(nil, "Deployment provision failed within timeout window", "name", latestDepl.Name, "old_status", oldStatus,
-		"current_status", latestDepl.Status, "timeout", specializationTimeout)
-
-	// this error appears in the executor pod logs
-	timeoutError := fmt.Errorf("failed to create deployment within the timeout window of %d seconds", specializationTimeout)
-	return nil, timeoutError
-}
-
 // cleanupNewdeploy cleans all kubernetes objects related to function
 func (deploy *NewDeploy) cleanupNewdeploy(ctx context.Context, ns string, name string) error {
 	var result error
@@ -509,58 +497,4 @@ func (deploy *NewDeploy) cleanupNewdeploy(ctx context.Context, ns string, name s
 	}
 
 	return result
-}
-
-// referencedResourcesRVSum returns the sum of resource version of all resources the function references to.
-// We used to update timestamp in the deployment environment field in order to trigger a rolling update when
-// the function referenced resources get updated. However, use timestamp means we are not able to avoid
-// triggering a rolling update when executor tries to adopt orphaned deployment due to timestamp changed which
-// is unwanted. In order to let executor adopt deployment without triggering a rolling update, we need an
-// identical way to get a value that can reflect resources changed without affecting by the time.
-// To achieve this goal, the sum of the resource version of all referenced resources is a good fit for our
-// scenario since the sum of the resource version is always the same as long as no resources changed.
-func referencedResourcesRVSum(ctx context.Context, client kubernetes.Interface, namespace string, secrets []fv1.SecretReference, cfgmaps []fv1.ConfigMapReference) (int, error) {
-	rvCount := 0
-
-	if len(secrets) > 0 {
-		list, err := client.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return 0, err
-		}
-
-		objmap := make(map[string]apiv1.Secret)
-		for _, secret := range list.Items {
-			objmap[secret.Namespace+"/"+secret.Name] = secret
-		}
-
-		for _, ref := range secrets {
-			s, ok := objmap[ref.Namespace+"/"+ref.Name]
-			if ok {
-				rv, _ := strconv.ParseInt(s.ResourceVersion, 10, 32)
-				rvCount += int(rv)
-			}
-		}
-	}
-
-	if len(cfgmaps) > 0 {
-		list, err := client.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return 0, err
-		}
-
-		objmap := make(map[string]apiv1.ConfigMap)
-		for _, cfg := range list.Items {
-			objmap[cfg.Namespace+"/"+cfg.Name] = cfg
-		}
-
-		for _, ref := range cfgmaps {
-			s, ok := objmap[ref.Namespace+"/"+ref.Name]
-			if ok {
-				rv, _ := strconv.ParseInt(s.ResourceVersion, 10, 32)
-				rvCount += int(rv)
-			}
-		}
-	}
-
-	return rvCount, nil
 }

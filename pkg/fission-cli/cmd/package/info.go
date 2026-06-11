@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package _package
 
@@ -27,6 +15,7 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/cmd"
 	pkgutil "github.com/fission/fission/pkg/fission-cli/cmd/package/util"
 	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
+	"github.com/fission/fission/pkg/fission-cli/util"
 )
 
 type InfoSubCommand struct {
@@ -52,7 +41,7 @@ func (opts *InfoSubCommand) complete(input cli.Input) (err error) {
 
 	_, opts.namespace, err = opts.GetResourceNamespace(input, flagkey.NamespacePackage)
 	if err != nil {
-		return fv1.AggregateValidationErrors("Environment", err)
+		return fv1.AggregateValidationErrors("Package", err)
 	}
 	return nil
 }
@@ -61,6 +50,14 @@ func (opts *InfoSubCommand) run(input cli.Input) error {
 	pkg, err := opts.Client().FissionClientSet.CoreV1().Packages(opts.namespace).Get(input.Context(), opts.name, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error finding package %s: %w", opts.name, err)
+	}
+
+	format, err := util.ParseOutputFormat(input.String(flagkey.Output))
+	if err != nil {
+		return err
+	}
+	if handled, err := util.PrintStructured(format, pkg); err != nil || handled {
+		return err
 	}
 
 	pkgutil.PrintPackageSummary(os.Stdout, pkg)

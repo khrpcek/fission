@@ -1,18 +1,6 @@
-/*
-Copyright 2018 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package logger
 
@@ -24,54 +12,74 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
-	k8sCache "k8s.io/client-go/tools/cache"
-
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/utils"
 )
 
+// loggerScheme registers the Kubernetes built-in types (Pods) the logger's
+// reconciler watches.
+var loggerScheme = runtime.NewScheme()
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(loggerScheme))
+}
+
 var nodeName = os.Getenv("NODE_NAME")
 
-const (
+// These are vars (not consts) so tests can redirect them to a temp directory;
+// in production they are never reassigned.
+var (
 	originalContainerLogPath = "/var/log/containers"
 	fissionSymlinkPath       = "/var/log/fission"
 )
 
-func podInformerHandlers(zapLogger logr.Logger) k8sCache.ResourceEventHandler {
-	return k8sCache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			pod := obj.(*corev1.Pod)
-			if !isValidFunctionPodOnNode(pod) || !utils.IsReadyPod(pod) {
-				return
-			}
-			err := createLogSymlinks(zapLogger, pod)
-			if err != nil {
-				funcName := pod.Labels[fv1.FUNCTION_NAME]
-				zapLogger.Error(err, "error creating symlink",
-					"function", funcName)
-			}
-		},
-		UpdateFunc: func(_, obj any) {
-			pod := obj.(*corev1.Pod)
-			if !isValidFunctionPodOnNode(pod) || !utils.IsReadyPod(pod) {
-				return
-			}
-			err := createLogSymlinks(zapLogger, pod)
-			if err != nil {
-				funcName := pod.Labels[fv1.FUNCTION_NAME]
-				zapLogger.Error(err, "error creating symlink",
-					"function", funcName)
-			}
-		},
-		DeleteFunc: func(obj any) {
-			// Do nothing here, let symlink reaper to recycle orphan symlink file
-		},
+// podReconciler creates log symlinks for valid, ready function pods scheduled on
+// this node, replacing the Pod informer's Add/Update handlers. It reacts to pod
+// STATUS changes (container IDs appear in Status.ContainerStatuses), so it must
+// NOT use GenerationChangedPredicate — that drops status-only updates and the
+// symlinks would never be created. A delete needs no handling here: the
+// symlinkReaper goroutine recycles orphan symlinks, so a NotFound (the pod is
+// gone) is a no-op, mirroring the old DeleteFunc.
+type podReconciler struct {
+	logger logr.Logger
+	client client.Client
+}
+
+func (r *podReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	pod := &corev1.Pod{}
+	if err := r.client.Get(ctx, req.NamespacedName, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Pod gone; symlinkReaper reaps any orphan symlink.
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
+	// Mirror the old Add/Update handlers: only act on valid function pods on this
+	// node that are ready. The cache is already scoped to this node by field
+	// selector when NODE_NAME is set, but isValidFunctionPodOnNode re-checks the
+	// node defensively (and is the only filter when NODE_NAME is unset).
+	if !isValidFunctionPodOnNode(pod) || !utils.IsReadyPod(pod) {
+		return ctrl.Result{}, nil
+	}
+	if err := createLogSymlinks(r.logger, pod); err != nil {
+		r.logger.Error(err, "error creating symlink", "function", pod.Labels[fv1.FUNCTION_NAME])
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 func createLogSymlinks(zapLogger logr.Logger, pod *corev1.Pod) error {
@@ -141,18 +149,33 @@ func symlinkReaper(zapLogger logr.Logger) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		err := filepath.Walk(fissionSymlinkPath, func(path string, info os.FileInfo, err error) error {
-			if target, e := os.Readlink(path); e == nil {
-				if _, pathErr := os.Stat(target); os.IsNotExist(pathErr) {
-					zapLogger.V(1).Info("remove symlink file", "filepath", path)
-					os.Remove(path)
+		reapStaleSymlinks(zapLogger, fissionSymlinkPath)
+	}
+}
+
+// reapStaleSymlinks walks dir once and removes any symlink whose target no
+// longer exists. Split out from symlinkReaper's ticker loop so the reaping
+// logic can be unit-tested without waiting on the timer.
+func reapStaleSymlinks(zapLogger logr.Logger, dir string) {
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Log and keep walking the rest of the tree rather than aborting
+			// the whole reap on one unreadable entry.
+			zapLogger.Error(err, "error walking symlink dir, skipping entry", "filepath", path)
+			return nil
+		}
+		if target, e := os.Readlink(path); e == nil {
+			if _, pathErr := os.Stat(target); os.IsNotExist(pathErr) {
+				zapLogger.V(1).Info("remove symlink file", "filepath", path)
+				if rmErr := os.Remove(path); rmErr != nil {
+					zapLogger.Error(rmErr, "error removing stale symlink", "filepath", path)
 				}
 			}
-			return nil
-		})
-		if err != nil {
-			zapLogger.Error(err, "error reaping symlink")
 		}
+		return nil
+	})
+	if err != nil {
+		zapLogger.Error(err, "error reaping symlink")
 	}
 }
 
@@ -173,21 +196,67 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	}
 	go symlinkReaper(logger)
 
-	kubernetesClient, err := clientGen.GetKubernetesClient()
+	restConfig, err := clientGen.GetRestConfig()
 	if err != nil {
 		return err
 	}
 
-	var wg wait.Group
-	for _, podInformer := range utils.GetK8sInformersForNamespaces(kubernetesClient, time.Minute*30, fv1.Pods) {
-		_, err := podInformer.AddEventHandler(podInformerHandlers(logger))
-		if err != nil {
-			return err
-		}
-		wg.StartWithChannel(ctx.Done(), podInformer.Run)
+	// The logger is a DaemonSet (one pod per node). Each node's logger MUST
+	// process its OWN pods, so the Manager MUST NOT use leader election — with
+	// leader election only one node's logger would run and logging would break on
+	// every other node. Build a non-leader-elected Manager whose every runnable
+	// (here the Pod reconciler) runs on this replica unconditionally.
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: loggerScheme,
+		Cache:  loggerCacheOptions(),
+		// No Manager-owned metrics/health servers: the logger serves none.
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+		LeaderElection:         false,
+		Logger:                 logger,
+	})
+	if err != nil {
+		return fmt.Errorf("unable to set up logger manager: %w", err)
 	}
-	wg.Wait()
+
+	pr := &podReconciler{
+		logger: logger.WithName("pod_reconciler"),
+		client: mgr.GetClient(),
+	}
+	// React to pod STATUS changes (container IDs appear in status), so do NOT use
+	// GenerationChangedPredicate. Pass no predicates to watch every pod event.
+	if err := controller.RegisterWithPredicates(mgr, &corev1.Pod{}, pr, "logger-pod", 0); err != nil {
+		return fmt.Errorf("unable to register pod reconciler: %w", err)
+	}
+
+	if err := mgr.Start(ctx); err != nil {
+		return fmt.Errorf("error running logger manager: %w", err)
+	}
 
 	logger.Error(nil, "Stop watching pod changes")
 	return nil
+}
+
+// loggerCacheOptions scopes the Manager's Pod cache to the Fission namespaces the
+// old per-namespace pod informers (GetK8sInformersForNamespaces) watched. The
+// fission-fluentbit ServiceAccount has pods list/watch only via per-namespace
+// Roles (no ClusterRole), so a cluster-wide cache would be forbidden and crashloop
+// on cache-sync. Within those namespaces, when NODE_NAME is set the Pod watch is
+// further scoped to this node (a per-node DaemonSet only needs its own node's
+// pods); isValidFunctionPodOnNode still filters in the reconciler.
+func loggerCacheOptions() crcache.Options {
+	resolver := utils.DefaultNSResolver()
+	nsConfig := map[string]crcache.Config{}
+	for _, ns := range resolver.FissionNSWithOptions(utils.WithBuilderNs(), utils.WithFunctionNs(), utils.WithDefaultNs()) {
+		nsConfig[ns] = crcache.Config{}
+	}
+	opts := crcache.Options{DefaultNamespaces: nsConfig}
+	if nodeName != "" {
+		opts.ByObject = map[client.Object]crcache.ByObject{
+			&corev1.Pod{}: {
+				Field: fields.OneTermEqualSelector("spec.nodeName", nodeName),
+			},
+		}
+	}
+	return opts
 }

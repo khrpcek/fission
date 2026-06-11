@@ -1,25 +1,12 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package function
 
 import (
 	"fmt"
 
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
@@ -79,46 +66,21 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 	secretNames := input.StringSlice(flagkey.FnSecret)
 	cfgMapNames := input.StringSlice(flagkey.FnCfgMap)
 
-	var secrets []fv1.SecretReference
-	var configMaps []fv1.ConfigMapReference
-
+	// Only overwrite secret/configmap refs when the flag was provided, so an
+	// update that doesn't mention them leaves the existing refs intact. Missing
+	// resources warn but don't abort (the update path is lenient).
 	if len(secretNames) > 0 {
-
-		// check that the referenced secret is in the same ns as the function, if not give a warning.
-		for _, secretName := range secretNames {
-			err := util.SecretExists(input.Context(), &metav1.ObjectMeta{Namespace: fnNamespace, Name: secretName}, opts.Client().KubernetesClient)
-			if k8serrors.IsNotFound(err) {
-				console.Warn(fmt.Sprintf("secret %s not found in Namespace: %s. Secret needs to be present in the same namespace as function", secretName, fnNamespace))
-			}
+		secrets, err := util.ResolveSecretReferences(input.Context(), opts.Client().KubernetesClient, secretNames, fnNamespace, true, false)
+		if err != nil {
+			return err
 		}
-
-		for _, secretName := range secretNames {
-			newSecret := fv1.SecretReference{
-				Name:      secretName,
-				Namespace: fnNamespace,
-			}
-			secrets = append(secrets, newSecret)
-		}
-
 		function.Spec.Secrets = secrets
 	}
 
 	if len(cfgMapNames) > 0 {
-
-		// check that the referenced cfgmap is in the same ns as the function, if not give a warning.
-		for _, cfgMapName := range cfgMapNames {
-			err := util.ConfigMapExists(input.Context(), &metav1.ObjectMeta{Namespace: fnNamespace, Name: cfgMapName}, opts.Client().KubernetesClient)
-			if k8serrors.IsNotFound(err) {
-				console.Warn(fmt.Sprintf("ConfigMap %s not found in Namespace: %s. ConfigMap needs to be present in the same namespace as the function", cfgMapName, fnNamespace))
-			}
-		}
-
-		for _, cfgMapName := range cfgMapNames {
-			newCfgMap := fv1.ConfigMapReference{
-				Name:      cfgMapName,
-				Namespace: fnNamespace,
-			}
-			configMaps = append(configMaps, newCfgMap)
+		configMaps, err := util.ResolveConfigMapReferences(input.Context(), opts.Client().KubernetesClient, cfgMapNames, fnNamespace, true, false)
+		if err != nil {
+			return err
 		}
 		function.Spec.ConfigMaps = configMaps
 	}
@@ -142,6 +104,22 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 	if input.IsSet(flagkey.FnIdleTimeout) {
 		fnTimeout := input.Int(flagkey.FnIdleTimeout)
 		function.Spec.IdleTimeout = &fnTimeout
+	}
+
+	// --streaming toggles the streaming config; when off it clears it (classic
+	// path). The other --streaming* flags only take effect alongside --streaming.
+	if input.IsSet(flagkey.FnStreaming) {
+		function.Spec.Streaming = getStreamingConfig(input)
+	}
+
+	// --expose-as-mcp toggles the MCP tool config; when off it clears it. The
+	// other --tool-* flags merge onto the existing config (only set fields change).
+	if input.IsSet(flagkey.FnExposeAsMCP) {
+		toolConfig, err := getToolConfig(input, function.Spec.Tool)
+		if err != nil {
+			return err
+		}
+		function.Spec.Tool = toolConfig
 	}
 
 	err = checkExecutorPoolManager(input, function.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType)

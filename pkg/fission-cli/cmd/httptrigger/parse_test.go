@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package httptrigger
 
@@ -615,6 +603,111 @@ func Test_getIngressTLS(t *testing.T) {
 			}
 			if gotTls != tt.wantTls {
 				t.Errorf("getIngressTLS() gotTls = %v, want %v", gotTls, tt.wantTls)
+			}
+		})
+	}
+}
+
+func Test_GetRouteConfig(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		provider  fv1.RouteProviderType
+		hosts     []string
+		path      string
+		anns      []string
+		tls       string
+		gateways  []string
+		fallback  string
+		wantNil   bool
+		wantErr   bool
+		assertion func(t *testing.T, rc *fv1.RouteConfig)
+	}{
+		{
+			name:    "no provider returns nil",
+			wantNil: true,
+		},
+		{
+			name:     "invalid provider errors",
+			provider: "nginx",
+			wantErr:  true,
+		},
+		{
+			name:     "gateway provider with namespaced parentRef",
+			provider: fv1.RouteProviderGateway,
+			hosts:    []string{"demo.example.com"},
+			path:     "/api",
+			gateways: []string{"envoy-gateway/eg", "other"},
+			assertion: func(t *testing.T, rc *fv1.RouteConfig) {
+				if rc.Provider != fv1.RouteProviderGateway {
+					t.Fatalf("provider = %q", rc.Provider)
+				}
+				if rc.Path != "/api" {
+					t.Fatalf("path = %q", rc.Path)
+				}
+				if rc.Gateway == nil || len(rc.Gateway.ParentRefs) != 2 {
+					t.Fatalf("expected 2 parentRefs, got %#v", rc.Gateway)
+				}
+				if rc.Gateway.ParentRefs[0].Namespace != "envoy-gateway" || rc.Gateway.ParentRefs[0].Name != "eg" {
+					t.Fatalf("parentRef[0] = %#v", rc.Gateway.ParentRefs[0])
+				}
+				if rc.Gateway.ParentRefs[1].Namespace != "" || rc.Gateway.ParentRefs[1].Name != "other" {
+					t.Fatalf("parentRef[1] = %#v", rc.Gateway.ParentRefs[1])
+				}
+			},
+		},
+		{
+			name:     "path defaults to fallback",
+			provider: fv1.RouteProviderIngress,
+			fallback: "/fallback",
+			assertion: func(t *testing.T, rc *fv1.RouteConfig) {
+				if rc.Path != "/fallback" {
+					t.Fatalf("path = %q, want /fallback", rc.Path)
+				}
+			},
+		},
+		{
+			name:     "annotations parsed",
+			provider: fv1.RouteProviderGateway,
+			anns:     []string{"key=value"},
+			gateways: []string{"eg"},
+			assertion: func(t *testing.T, rc *fv1.RouteConfig) {
+				if rc.Annotations["key"] != "value" {
+					t.Fatalf("annotations = %#v", rc.Annotations)
+				}
+			},
+		},
+		{
+			name:     "malformed gateway parentRef errors",
+			provider: fv1.RouteProviderGateway,
+			gateways: []string{"/eg"},
+			wantErr:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			rc, err := GetRouteConfig(string(tt.provider), tt.hosts, tt.path, tt.anns, tt.tls, tt.gateways, tt.fallback)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantNil {
+				if rc != nil {
+					t.Fatalf("expected nil RouteConfig, got %#v", rc)
+				}
+				return
+			}
+			if rc == nil {
+				t.Fatal("expected non-nil RouteConfig")
+			}
+			if tt.assertion != nil {
+				tt.assertion(t, rc)
 			}
 		})
 	}

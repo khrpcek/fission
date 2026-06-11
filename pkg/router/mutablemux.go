@@ -1,24 +1,11 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package router
 
 import (
 	"net/http"
-	"os"
 	"sync/atomic"
 
 	"github.com/go-logr/logr"
@@ -49,9 +36,10 @@ func (mr *mutableRouter) ServeHTTP(responseWriter http.ResponseWriter, request *
 		router.ServeHTTP(responseWriter, request)
 		return
 	}
-	// This should never happen, but if it does, log an error and exit.
+	// This should never happen. Degrade gracefully with a 503 instead of
+	// crashing the whole router process and dropping every other request.
 	mr.logger.Error(nil, "router is nil")
-	os.Exit(1)
+	http.Error(responseWriter, "router not initialized", http.StatusServiceUnavailable)
 }
 
 func (mr *mutableRouter) updateRouter(newHandler *mux.Router) {

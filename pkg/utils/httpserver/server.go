@@ -1,17 +1,37 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package httpserver
 
 import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
-
-	"github.com/fission/fission/pkg/utils/manager"
+	"golang.org/x/sync/errgroup"
 )
 
-func StartServer(ctx context.Context, log logr.Logger, mgr manager.Interface, svc string, port string, handler http.Handler) {
+// defaultDrainTimeout bounds how long a server waits for in-flight requests to
+// complete during graceful shutdown. Overridable via GRACEFUL_SHUTDOWN_TIMEOUT
+// (any time.ParseDuration value). Keep it at or below the pod's
+// terminationGracePeriodSeconds so the drain finishes before SIGKILL.
+const defaultDrainTimeout = 30 * time.Second
+
+func drainTimeout() time.Duration {
+	if v := os.Getenv("GRACEFUL_SHUTDOWN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultDrainTimeout
+}
+
+func StartServer(ctx context.Context, log logr.Logger, mgr *errgroup.Group, svc string, port string, handler http.Handler) {
 	if !strings.Contains(port, ":") {
 		port = fmt.Sprintf(":%s", port)
 	}
@@ -21,16 +41,24 @@ func StartServer(ctx context.Context, log logr.Logger, mgr manager.Interface, sv
 	}
 	l := log.WithValues("service", svc, "addr", server.Addr)
 	l.Info("starting server")
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		if err := server.ListenAndServe(); err != nil {
 			if err != http.ErrServerClosed {
 				l.Error(err, "server error")
 			}
 		}
+		return nil
 	})
 	<-ctx.Done()
-	l.Info("shutting down server")
-	if err := server.Shutdown(ctx); err != nil {
+	// ctx is already cancelled here (that is why we woke up), so it cannot be
+	// used to bound the drain — Shutdown(ctx) would return immediately and cut
+	// in-flight requests. Use a fresh timeout context so requests get a window
+	// to complete before connections are closed.
+	timeout := drainTimeout()
+	l.Info("shutting down server", "drainTimeout", timeout)
+	drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := server.Shutdown(drainCtx); err != nil {
 		if err != context.Canceled && err != context.DeadlineExceeded {
 			l.Error(err, "server shutdown error")
 		}

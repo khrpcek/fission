@@ -72,6 +72,7 @@ webhooks:
     - v1
     operations:
     - CREATE
+    - UPDATE
     resources:
     - environments
   sideEffects: None
@@ -95,27 +96,6 @@ webhooks:
     - UPDATE
     resources:
     - functions
-  sideEffects: None
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    caBundle: {{ $caBundleValue }}
-    service:
-      name: webhook-service
-      namespace:  {{ .Release.Namespace }}
-      path: /validate-fission-io-v1-httptrigger
-  failurePolicy: Fail
-  name: vhttptrigger.fission.io
-  rules:
-  - apiGroups:
-    - fission.io
-    apiVersions:
-    - v1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - httptriggers
   sideEffects: None
 - admissionReviewVersions:
   - v1
@@ -179,25 +159,4 @@ webhooks:
     - UPDATE
     resources:
     - packages
-  sideEffects: None
-- admissionReviewVersions:
-  - v1
-  clientConfig:
-    caBundle: {{ $caBundleValue }}
-    service:
-      name: webhook-service
-      namespace:  {{ .Release.Namespace }}
-      path: /validate-fission-io-v1-timetrigger
-  failurePolicy: Fail
-  name: vtimetrigger.fission.io
-  rules:
-  - apiGroups:
-    - fission.io
-    apiVersions:
-    - v1
-    operations:
-    - CREATE
-    - UPDATE
-    resources:
-    - timetriggers
   sideEffects: None

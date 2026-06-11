@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package httptrigger
 
@@ -76,7 +64,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 
 	userProvidedNS, fnNamespace, err := opts.GetResourceNamespace(input, flagkey.NamespaceFunction)
 	if err != nil {
-		return fmt.Errorf("error in deleting function : %w", err)
+		return fmt.Errorf("error in creating HTTP trigger : %w", err)
 	}
 
 	triggerUrl := input.String(flagkey.HtUrl)
@@ -122,26 +110,8 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 
 	// For Specs, the spec validate checks for function reference
 	if input.Bool(flagkey.SpecSave) {
-		specDir := util.GetSpecDir(input)
-		specIgnore := util.GetSpecIgnore(input)
-		fr, err := spec.ReadSpecs(specDir, specIgnore, false)
-		if err != nil {
-			return fmt.Errorf("error reading spec in '%v': %w", specDir, err)
-		}
-		for _, fn := range functionList {
-			exists, err := fr.ExistsInSpecs(fv1.Function{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      fn,
-					Namespace: userProvidedNS,
-				},
-			})
-			if err != nil {
-				return err
-			}
-			if !exists {
-				console.Warn(fmt.Sprintf("HTTPTrigger '%v' references unknown Function '%v', please create it before applying spec",
-					triggerName, fn))
-			}
+		if err := spec.CheckFunctionReferencesInSpecs(input, "HTTPTrigger", triggerName, functionList, userProvidedNS); err != nil {
+			return err
 		}
 	} else {
 
@@ -164,6 +134,8 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 		}
 	}
 
+	warnIngressDeprecated(input)
+
 	ingressConfig, err := GetIngressConfig(
 		input.StringSlice(flagkey.HtIngressAnnotation), input.String(flagkey.HtIngressRule),
 		input.String(flagkey.HtIngressTLS), fallbackURL, nil)
@@ -180,6 +152,12 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 		} else if className != "" {
 			ingressConfig.IngressClassName = &className
 		}
+	routeConfig, err := GetRouteConfig(
+		input.String(flagkey.HtRouteProvider), input.StringSlice(flagkey.HtRouteHost),
+		input.String(flagkey.HtRoutePath), input.StringSlice(flagkey.HtRouteAnnotation),
+		input.String(flagkey.HtRouteTLS), input.StringSlice(flagkey.HtGateway), fallbackURL)
+	if err != nil {
+		return fmt.Errorf("error parsing route configuration: %w", err)
 	}
 
 	opts.trigger = &fv1.HTTPTrigger{
@@ -191,6 +169,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 			FunctionReference: *functionRef,
 			CreateIngress:     input.Bool(flagkey.HtIngress),
 			IngressConfig:     *ingressConfig,
+			RouteConfig:       routeConfig,
 			Prefix:            &prefix,
 			KeepPrefix:        input.Bool(flagkey.HtKeepPrefix),
 		},
@@ -200,19 +179,9 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 }
 
 func (opts *CreateSubCommand) run(input cli.Input) error {
-	// if we're writing a spec, don't call the API
-	// save to spec file or display the spec to console
-	if input.Bool(flagkey.SpecDry) {
-		return spec.SpecDry(*opts.trigger)
-	}
-
-	if input.Bool(flagkey.SpecSave) {
-		specFile := fmt.Sprintf("route-%v.yaml", opts.trigger.Name)
-		err := spec.SpecSave(*opts.trigger, specFile, false)
-		if err != nil {
-			return fmt.Errorf("error saving HTTP trigger spec: %w", err)
-		}
-		return nil
+	// if we're writing a spec, don't call the API; save/print and return.
+	if handled, err := spec.SaveOrDry(input, *opts.trigger, fmt.Sprintf("route-%v.yaml", opts.trigger.Name)); handled {
+		return err
 	}
 
 	// Ensure we don't have a duplicate HTTP route defined (same URL and method)
@@ -229,6 +198,17 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 	fmt.Printf("trigger '%v' created\n", opts.trigger.Name)
 
 	return nil
+}
+
+// warnIngressDeprecated emits a deprecation warning when any of the legacy
+// --createingress / --ingress* flags are used, pointing users at the Gateway
+// API. Shared by the create and update subcommands.
+func warnIngressDeprecated(input cli.Input) {
+	if input.Bool(flagkey.HtIngress) || input.IsSet(flagkey.HtIngressRule) ||
+		input.IsSet(flagkey.HtIngressAnnotation) || input.IsSet(flagkey.HtIngressTLS) {
+		console.Warn("--createingress and --ingress* are deprecated: the Kubernetes Ingress API is frozen. " +
+			"Expose functions through the Gateway API instead, e.g. --route-provider gateway --gateway <name> --route-host <host>.")
+	}
 }
 
 // GetMethod returns one of HTTP method

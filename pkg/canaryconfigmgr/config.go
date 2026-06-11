@@ -1,18 +1,6 @@
-/*
-Copyright 2018 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package canaryconfigmgr
 
@@ -20,18 +8,18 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/go-logr/logr"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/controller"
 	config "github.com/fission/fission/pkg/featureconfig"
-	"github.com/fission/fission/pkg/generated/clientset/versioned"
-	"github.com/fission/fission/pkg/utils/manager"
+	"github.com/fission/fission/pkg/utils/crmanager"
 )
 
 // ConfigureFeatures gets the feature config and configures the features that are enabled
-func ConfigureFeatures(ctx context.Context, logger logr.Logger, unitTestMode bool, fissionClient versioned.Interface,
-	kubeClient kubernetes.Interface, mgr manager.Interface) error {
+func ConfigureFeatures(ctx context.Context, restConfig *rest.Config, logger logr.Logger, unitTestMode bool) error {
 	// set feature enabled to false if unitTestMode
 	if unitTestMode {
 		return nil
@@ -46,11 +34,29 @@ func ConfigureFeatures(ctx context.Context, logger logr.Logger, unitTestMode boo
 
 	// configure respective features
 	// in the future when new optional features are added, we need to add corresponding feature handlers and invoke them here
-	canaryCfgMgr, err := MakeCanaryConfigMgr(ctx, logger, fissionClient, kubeClient, featureConfig.CanaryConfig.PrometheusSvc)
+
+	// Active-passive HA via native controller-runtime leader election: only the
+	// elected leader progresses canary rollouts, so two replicas don't both
+	// shift HTTPTrigger weights. No-op when LEADER_ELECTION_ENABLED is unset
+	// (single-replica default). The reconciler watches through the Manager's
+	// namespace-scoped cache and runs only on the elected leader.
+	crMgr, err := crmanager.NewLeaderElected(restConfig, "fission-canaryconfig", logger)
+	if err != nil {
+		return err
+	}
+
+	canaryCfgMgr, err := MakeCanaryConfigMgr(logger, crMgr.GetClient(), crMgr.GetAPIReader(), featureConfig.CanaryConfig.PrometheusSvc)
 	if err != nil {
 		return fmt.Errorf("failed to start canary config manager: %w", err)
 	}
-	canaryCfgMgr.Run(ctx, mgr)
 
-	return err
+	r := &CanaryConfigReconciler{
+		logger: logger.WithName("canaryconfig_reconciler"),
+		client: crMgr.GetClient(),
+		mgr:    canaryCfgMgr,
+	}
+	if err := controller.Register(crMgr, &fv1.CanaryConfig{}, r, "canaryconfig"); err != nil {
+		return fmt.Errorf("error registering canaryconfig reconciler: %w", err)
+	}
+	return crMgr.Start(ctx)
 }

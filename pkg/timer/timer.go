@@ -1,18 +1,6 @@
-/*
-Copyright 2017 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package timer
 
@@ -28,16 +16,10 @@ import (
 	"github.com/fission/fission/pkg/utils"
 )
 
-type requestType int
-
-const (
-	SYNC requestType = iota
-)
-
 type (
 	Timer struct {
 		logger    logr.Logger
-		triggers  map[types.UID]*timerTriggerWithCron
+		triggers  map[types.NamespacedName]*timerTriggerWithCron
 		routerUrl string
 	}
 
@@ -50,10 +32,48 @@ type (
 func MakeTimer(logger logr.Logger, routerUrl string) *Timer {
 	timer := &Timer{
 		logger:    logger.WithName("timer"),
-		triggers:  make(map[types.UID]*timerTriggerWithCron),
+		triggers:  make(map[types.NamespacedName]*timerTriggerWithCron),
 		routerUrl: routerUrl,
 	}
 	return timer
+}
+
+// addUpdate (re)registers the cron entry for a time trigger. An existing entry
+// for the same trigger is stopped and replaced so a changed schedule takes
+// effect. Keyed by namespaced name so the reconciler can tear it down on a
+// delete (when only the name is known).
+func (timer *Timer) addUpdate(timeTrigger *fv1.TimeTrigger) {
+	key := types.NamespacedName{Namespace: timeTrigger.Namespace, Name: timeTrigger.Name}
+	logger := timer.logger.WithValues("trigger_name", timeTrigger.Name, "trigger_namespace", timeTrigger.Namespace)
+
+	if item, ok := timer.triggers[key]; ok {
+		if item.cron != nil {
+			item.cron.Stop()
+		}
+		item.trigger = *timeTrigger
+		item.cron = timer.newCron(*timeTrigger, timer.routerUrl)
+		logger.V(1).Info("cron updated")
+		return
+	}
+	timer.triggers[key] = &timerTriggerWithCron{
+		trigger: *timeTrigger,
+		cron:    timer.newCron(*timeTrigger, timer.routerUrl),
+	}
+	logger.V(1).Info("cron added")
+}
+
+// remove stops and drops the cron entry for a deleted time trigger. No-op if
+// the trigger was never registered (e.g. a delete observed before any add).
+func (timer *Timer) remove(key types.NamespacedName) {
+	item, ok := timer.triggers[key]
+	if !ok {
+		return
+	}
+	if item.cron != nil {
+		item.cron.Stop()
+	}
+	delete(timer.triggers, key)
+	timer.logger.WithValues("trigger_name", key.Name, "trigger_namespace", key.Namespace).V(1).Info("cron deleted")
 }
 
 func (timer *Timer) newCron(t fv1.TimeTrigger, routerUrl string) *cron.Cron {

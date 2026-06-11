@@ -1,18 +1,7 @@
-/*
-Copyright 2016 The Fission Authors.
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package util
 
 import (
@@ -167,6 +156,61 @@ func Test_mergeContainer(t *testing.T) {
 	}
 }
 
+// TestMergeContainer_SanitizesSecurityContext pins the GHSA-m63v-2g9w-2w6v
+// invariant: MergeContainer is the path for the Environment Runtime.Container /
+// Builder.Container fields, which do not go through any PodSpec and so are not
+// reached by MergePodSpec's sanitizer. A tenant-supplied container with
+// privileged=true / allowPrivilegeEscalation=true / dangerous caps must be
+// sanitized in the merged result, while the caller's source container must not
+// be mutated (it is typically env.Spec.Runtime.Container from an informer
+// cache).
+func TestMergeContainer_SanitizesSecurityContext(t *testing.T) {
+	on := true
+	dst := &apiv1.Container{Name: "py", Image: "fission/python-env:latest"}
+	src := &apiv1.Container{
+		Name: "py",
+		SecurityContext: &apiv1.SecurityContext{
+			Privileged:               &on,
+			AllowPrivilegeEscalation: &on,
+			Capabilities: &apiv1.Capabilities{
+				Add: []apiv1.Capability{"SYS_ADMIN", "NET_BIND_SERVICE", "NET_ADMIN"},
+			},
+		},
+	}
+
+	out, err := MergeContainer(dst, src)
+	if err != nil {
+		t.Fatalf("MergeContainer error: %v", err)
+	}
+	if out.SecurityContext == nil {
+		t.Fatalf("merged container must keep a SecurityContext")
+	}
+	if out.SecurityContext.Privileged != nil && *out.SecurityContext.Privileged {
+		t.Errorf("Privileged=true must be sanitized to false")
+	}
+	if out.SecurityContext.AllowPrivilegeEscalation != nil && *out.SecurityContext.AllowPrivilegeEscalation {
+		t.Errorf("AllowPrivilegeEscalation=true must be sanitized to false")
+	}
+	gotCaps := map[apiv1.Capability]bool{}
+	for _, c := range out.SecurityContext.Capabilities.Add {
+		gotCaps[c] = true
+	}
+	if gotCaps["SYS_ADMIN"] || gotCaps["NET_ADMIN"] {
+		t.Errorf("non-allowlisted capabilities must be stripped, got %v", out.SecurityContext.Capabilities.Add)
+	}
+	if !gotCaps["NET_BIND_SERVICE"] {
+		t.Errorf("allowlisted capability NET_BIND_SERVICE must flow through")
+	}
+
+	// The caller's source container must not be mutated by the merge.
+	if src.SecurityContext.Privileged == nil || !*src.SecurityContext.Privileged {
+		t.Errorf("source container Privileged must be left untouched (deep copy expected)")
+	}
+	if len(src.SecurityContext.Capabilities.Add) != 3 {
+		t.Errorf("source container capabilities must be left untouched, got %v", src.SecurityContext.Capabilities.Add)
+	}
+}
+
 func Test_mergeVolumeLists(t *testing.T) {
 	type args struct {
 		dst []apiv1.Volume
@@ -249,8 +293,8 @@ func Test_mergeContainerList(t *testing.T) {
 				},
 			},
 			want: []apiv1.Container{
-				{Name: "foo", Image: "my-custom-image-1", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}, {Name: "test", Value: "foobar"}}},
-				{Name: "foo2", Image: "my-custom-image-2", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}, {Name: "env3", Value: "foobar"}, {Name: "env4", Value: "barfoo"}}},
+				{Name: "foo", Image: "my-custom-image-1", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}, {Name: "test", Value: "foobar"}}, SecurityContext: nil},
+				{Name: "foo2", Image: "my-custom-image-2", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}, {Name: "env3", Value: "foobar"}, {Name: "env4", Value: "barfoo"}}, SecurityContext: nil},
 			},
 			wantErr: false,
 		},
@@ -287,7 +331,7 @@ func Test_mergeContainerList(t *testing.T) {
 				},
 			},
 			want: []apiv1.Container{
-				{Name: "foo", Image: "my-custom-image-1", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}, {Name: "test", Value: "foobar"}}},
+				{Name: "foo", Image: "my-custom-image-1", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}, {Name: "test", Value: "foobar"}}, SecurityContext: nil},
 				{Name: "foo2", Image: "dummy-image-2", Env: []apiv1.EnvVar{{Name: "env1", Value: "foobar"}, {Name: "env2", Value: "barfoo"}}},
 				{Name: "foo4", Image: "my-custom-image-2", Env: []apiv1.EnvVar{{Name: "env3", Value: "foobar"}, {Name: "env4", Value: "barfoo"}}},
 			},
@@ -329,5 +373,150 @@ func Test_mergeContainerList(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMergePodSpec_StripsDangerousFields pins the GHSA-gx55 / GHSA-wmgg /
+// GHSA-v455 invariant on the merge layer: node-escape PodSpec fields supplied
+// by a target (env.Spec.Runtime.PodSpec / Function.Spec.PodSpec / builder
+// podSpecPatch) must NOT propagate onto the src spec. The admission webhook
+// is the primary defence; this is belt-and-braces for clusters running with
+// failurePolicy=Ignore or stale objects from a pre-webhook upgrade window.
+//
+// Pod-level SecurityContext IS propagated (the chart's runtimePodSpec /
+// builderPodSpec features use it for operator hardening like runAsNonRoot /
+// fsGroup / runAsUser=10001). The webhook denylist handles tenant-supplied
+// per-container privileged / allowPrivilegeEscalation / dangerous-cap
+// vectors which are the actual node-escape primitives.
+func TestMergePodSpec_StripsDangerousFields(t *testing.T) {
+	on := true
+	runAsUser := int64(10001)
+	runAsNonRoot := true
+	src := &apiv1.PodSpec{
+		Containers: []apiv1.Container{{Name: "user", Image: "fission/python-env:latest"}},
+	}
+	target := &apiv1.PodSpec{
+		HostNetwork:        true,
+		HostPID:            true,
+		HostIPC:            true,
+		ServiceAccountName: "cluster-admin",
+		SecurityContext: &apiv1.PodSecurityContext{
+			RunAsUser:    &runAsUser,
+			RunAsNonRoot: &runAsNonRoot,
+		},
+		Volumes: []apiv1.Volume{{
+			Name: "host-root",
+			VolumeSource: apiv1.VolumeSource{
+				HostPath: &apiv1.HostPathVolumeSource{Path: "/"},
+			},
+		}},
+		Containers: []apiv1.Container{{
+			Name:            "user",
+			SecurityContext: &apiv1.SecurityContext{Privileged: &on},
+		}},
+	}
+
+	out, _ := MergePodSpec(src, target)
+
+	if out.HostNetwork {
+		t.Errorf("HostNetwork must not propagate from target")
+	}
+	if out.HostPID {
+		t.Errorf("HostPID must not propagate from target")
+	}
+	if out.HostIPC {
+		t.Errorf("HostIPC must not propagate from target")
+	}
+	if out.ServiceAccountName != "" {
+		t.Errorf("ServiceAccountName override must not propagate, got %q", out.ServiceAccountName)
+	}
+	// Pod-level SecurityContext MUST flow through to support operator
+	// hardening from the chart's runtimePodSpec / builderPodSpec features.
+	if out.SecurityContext == nil {
+		t.Errorf("pod-level SecurityContext must propagate for operator hardening")
+	} else if out.SecurityContext.RunAsUser == nil || *out.SecurityContext.RunAsUser != 10001 {
+		t.Errorf("RunAsUser=10001 must propagate, got %+v", out.SecurityContext.RunAsUser)
+	}
+	for _, v := range out.Volumes {
+		if v.HostPath != nil {
+			t.Errorf("hostPath volume %q must not propagate", v.Name)
+		}
+	}
+}
+
+// TestMergePodSpec_SanitizesContainerSecurityContext pins the
+// container-level defence-in-depth: even if admission was bypassed
+// (failurePolicy=Ignore or stale objects), per-container
+// privileged=true / allowPrivilegeEscalation=true / non-allowlisted
+// capabilities.add entries must be stripped from the merged result.
+// The webhook is the primary defence; this layer makes the bits
+// unreachable on webhook-bypass clusters. Closes GHSA-gx55 / GHSA-wmgg
+// / GHSA-v455 and the GHSA-qf5v allowlist (the structural drop:["ALL"]
+// is left for a follow-up that audits Fission's own sidecar containers).
+func TestMergePodSpec_SanitizesContainerSecurityContext(t *testing.T) {
+	on := true
+	src := &apiv1.PodSpec{
+		Containers: []apiv1.Container{{Name: "user", Image: "fission/python-env:latest"}},
+	}
+	target := &apiv1.PodSpec{
+		Containers: []apiv1.Container{{
+			Name: "user",
+			SecurityContext: &apiv1.SecurityContext{
+				Privileged:               &on,
+				AllowPrivilegeEscalation: &on,
+				Capabilities: &apiv1.Capabilities{
+					Add: []apiv1.Capability{
+						"SYS_ADMIN",        // denylist holdover — stripped
+						"SYS_TIME",         // GHSA-qf5v exemplar — stripped
+						"NET_BIND_SERVICE", // allowlisted — flows through
+						"NET_ADMIN",        // stripped
+						"CHOWN",            // OCI default; not in allowlist — stripped
+					},
+				},
+			},
+		}},
+		InitContainers: []apiv1.Container{{
+			Name: "init",
+			SecurityContext: &apiv1.SecurityContext{
+				Privileged: &on,
+			},
+		}},
+	}
+
+	out, _ := MergePodSpec(src, target)
+
+	var merged *apiv1.Container
+	for i := range out.Containers {
+		if out.Containers[i].Name == "user" {
+			merged = &out.Containers[i]
+			break
+		}
+	}
+	if merged == nil || merged.SecurityContext == nil {
+		t.Fatalf("merged user container with SecurityContext expected")
+	}
+	if merged.SecurityContext.Privileged != nil && *merged.SecurityContext.Privileged {
+		t.Errorf("Privileged=true must be sanitized to false")
+	}
+	if merged.SecurityContext.AllowPrivilegeEscalation != nil && *merged.SecurityContext.AllowPrivilegeEscalation {
+		t.Errorf("AllowPrivilegeEscalation=true must be sanitized to false")
+	}
+	// Only NET_BIND_SERVICE is on the allowlist; everything else must be stripped.
+	gotAdd := map[apiv1.Capability]bool{}
+	for _, cap := range merged.SecurityContext.Capabilities.Add {
+		gotAdd[cap] = true
+	}
+	for _, cap := range []apiv1.Capability{"SYS_ADMIN", "SYS_TIME", "NET_ADMIN", "CHOWN"} {
+		if gotAdd[cap] {
+			t.Errorf("non-allowlisted capability %q must be stripped, got %v", cap, merged.SecurityContext.Capabilities.Add)
+		}
+	}
+	if !gotAdd["NET_BIND_SERVICE"] {
+		t.Errorf("allowlisted capability NET_BIND_SERVICE must flow through")
+	}
+
+	// InitContainer must also be sanitized for Privileged.
+	if out.InitContainers[0].SecurityContext.Privileged != nil && *out.InitContainers[0].SecurityContext.Privileged {
+		t.Errorf("InitContainer privileged=true must be sanitized to false")
 	}
 }

@@ -110,6 +110,23 @@ Helper template to construct image names with repository and tag
 {{- end}}
 
 {{/*
+leaderElection.envs renders the env entries that enable client-go leader
+election for a control-plane controller subsystem. Pass a dict with key
+"enabled" (bool). POD_NAME identifies the lease holder; the lease namespace
+falls back to the in-cluster service-account namespace when POD_NAMESPACE is
+unset, so it is intentionally not emitted here (some deployments already set
+it). Disabled by default → behaviour is unchanged for single-replica installs.
+*/}}
+{{- define "leaderElection.envs" }}
+- name: LEADER_ELECTION_ENABLED
+  value: {{ .enabled | default false | quote }}
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+{{- end }}
+
+{{/*
 internalAuth.envs renders the two env entries that wire the HMAC shared
 secret into a Fission control-plane container. See the design at docs/internal-auth/00-design.md. The OLD
 secret is mounted with optional: true so rotation can drop it without
@@ -153,3 +170,36 @@ Define the svc's name
 {{- printf "%s" .Values.defaultNamespace -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+coverage.* helpers: emit GOCOVERDIR env, a hostPath volumeMount, and the
+hostPath volume for integration-test binary coverage. DEV/CI ONLY — gated
+by .Values.coverage.enabled (default false), so they render nothing in
+production. See values.yaml `coverage`.
+*/}}
+{{- define "coverage.envs" }}
+{{- if .Values.coverage.enabled }}
+- name: GOCOVERDIR
+  value: {{ .Values.coverage.mountPath | default "/coverage" | quote }}
+{{- end }}
+{{- end }}
+
+{{- define "coverage.volumemount" }}
+{{- if .Values.coverage.enabled }}
+- name: coverage-data
+  mountPath: {{ .Values.coverage.mountPath | default "/coverage" | quote }}
+{{- end }}
+{{- end }}
+
+{{- define "coverage.volume" }}
+{{- if .Values.coverage.enabled }}
+- name: coverage-data
+  hostPath:
+    path: {{ .Values.coverage.hostPath | default "/fission-coverage" | quote }}
+    # Directory (not DirectoryOrCreate): the dir MUST be pre-created on the
+    # node owned by the pod uid (see values.yaml + the CI workflow). This
+    # enforces the uid-owned/0700 contract and fails loudly if misconfigured
+    # rather than letting kubelet create a root-owned dir.
+    type: Directory
+{{- end }}
+{{- end }}

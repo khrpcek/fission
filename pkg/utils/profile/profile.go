@@ -1,18 +1,6 @@
-/*
-Copyright 2021 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 // To use profile in a go program over http
 // import this package and call ProfileIfEnabled()
@@ -30,12 +18,12 @@ import (
 	"os"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/fission/fission/pkg/utils/httpserver"
-	"github.com/fission/fission/pkg/utils/manager"
 )
 
-func ProfileIfEnabled(ctx context.Context, logger logr.Logger, mgr manager.Interface) {
+func ProfileIfEnabled(ctx context.Context, logger logr.Logger, mgr *errgroup.Group) {
 	enablePprof := os.Getenv("PPROF_ENABLED")
 	if enablePprof != "true" {
 		return
@@ -48,7 +36,8 @@ func ProfileIfEnabled(ctx context.Context, logger logr.Logger, mgr manager.Inter
 	pprofMux := http.DefaultServeMux
 	http.DefaultServeMux = http.NewServeMux()
 
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		httpserver.StartServer(ctx, logger, mgr, "pprof", pprofPort, pprofMux)
+		return nil
 	})
 }

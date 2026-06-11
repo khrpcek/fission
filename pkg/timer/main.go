@@ -1,18 +1,6 @@
-/*
-Copyright 2017 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package timer
 
@@ -21,15 +9,22 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/crd"
-	"github.com/fission/fission/pkg/utils/manager"
+	"github.com/fission/fission/pkg/utils/crmanager"
 )
 
-func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr manager.Interface, routerUrl string) error {
+func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, _ *errgroup.Group, routerUrl string) error {
 	fissionClient, err := clientGen.GetFissionClient()
 	if err != nil {
 		return fmt.Errorf("failed to get fission client: %w", err)
+	}
+	restConfig, err := clientGen.GetRestConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get rest config: %w", err)
 	}
 
 	err = crd.WaitForFunctionCRDs(ctx, logger, fissionClient)
@@ -37,10 +32,22 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		return fmt.Errorf("error waiting for CRDs: %w", err)
 	}
 
-	timerSync, err := MakeTimerSync(ctx, logger, fissionClient, MakeTimer(logger, routerUrl))
+	// Active-passive HA via native controller-runtime leader election: only the
+	// elected leader schedules cron triggers, so two replicas don't double-fire
+	// timers. No-op when LEADER_ELECTION_ENABLED is unset (single-replica
+	// default). The TimeTrigger reconciler watches through the Manager's
+	// namespace-scoped cache and runs only on the elected leader.
+	crMgr, err := crmanager.NewLeaderElected(restConfig, "fission-timer", logger)
 	if err != nil {
-		return fmt.Errorf("error making timer sync: %w", err)
+		return err
 	}
-	timerSync.Run(ctx, mgr)
-	return nil
+	r := &TimeTriggerReconciler{
+		logger: logger.WithName("timetrigger_reconciler"),
+		client: crMgr.GetClient(),
+		timer:  MakeTimer(logger, routerUrl),
+	}
+	if err := controller.Register(crMgr, &fv1.TimeTrigger{}, r, "timetrigger"); err != nil {
+		return fmt.Errorf("error registering timetrigger reconciler: %w", err)
+	}
+	return crMgr.Start(ctx)
 }

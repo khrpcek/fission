@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package flagkey
 
@@ -80,6 +68,14 @@ const (
 	FnTestHeader            = "header"
 	FnTestQuery             = "query"
 	FnIdleTimeout           = "idletimeout"
+	FnStreaming             = "streaming"
+	FnStreamingProtocol     = "streamingprotocol"
+	FnStreamingIdleTimeout  = "streamingidletimeout"
+	FnStreamingMaxDuration  = "streamingmaxduration"
+	FnExposeAsMCP           = "expose-as-mcp"
+	FnToolDescription       = "tool-description"
+	FnToolInputSchema       = "tool-input-schema"
+	FnToolName              = "tool-name"
 	FnConcurrency           = "concurrency"
 	FnRequestsPerPod        = "requestsperpod"
 	FnOnceOnly              = "onceonly"
@@ -97,6 +93,12 @@ const (
 	HtIngressAnnotation = "ingressannotation"
 	HtIngressTLS        = "ingresstls"
 	HtIngressClassName  = "ingressclassname"
+	HtRouteProvider     = "route-provider"
+	HtRouteHost         = "route-host"
+	HtRoutePath         = "route-path"
+	HtRouteAnnotation   = "route-annotation"
+	HtRouteTLS          = "route-tls"
+	HtGateway           = "gateway"
 	HtFnName            = "function"
 	HtFnWeight          = "weight"
 	HtFilter            = HtFnName
@@ -159,6 +161,7 @@ const (
 	PkgSrcChecksum    = "srcchecksum"
 	PkgDeployChecksum = "deploychecksum"
 	PkgInsecure       = "insecure"
+	PkgOCI            = "oci"
 	PkgBuildCmd       = "buildcmd"
 	PkgOutput         = Output
 	PkgStatus         = "status"
@@ -172,6 +175,7 @@ const (
 	SpecWatch            = "watch"
 	SpecDelete           = "delete"
 	SpecDry              = "dry"
+	SpecApplyDryRun      = "dry-run"
 	SpecValidate         = "validation"
 	SpecIgnore           = "specignore"
 	SpecApplyCommitLabel = "commitlabel"
@@ -191,6 +195,9 @@ const (
 	ArchiveName   = resourceName
 	ArchiveID     = "id"
 	ArchiveOutput = Output
+
+	WaitFor     = "for"
+	WaitTimeout = "timeout"
 
 	DefaultSpecOutputDir = "fission-dump"
 )

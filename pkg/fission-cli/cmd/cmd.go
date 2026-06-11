@@ -1,24 +1,14 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package cmd
 
 import (
 	"os"
 	"sync"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/fission/fission/pkg/fission-cli/cliwrapper/cli"
 	"github.com/fission/fission/pkg/fission-cli/console"
@@ -39,6 +29,15 @@ func SetClientset(client Client) {
 	once.Do(func() {
 		defaultClient = client
 	})
+}
+
+// ResetClientsetForTest clears the once-set default client so a unit test can
+// install its own (fake) client deterministically. It exists because
+// SetClientset is guarded by a sync.Once for the real CLI; tests must be able
+// to reset that. Intended for tests only.
+func ResetClientsetForTest() {
+	once = sync.Once{}
+	defaultClient = Client{}
 }
 
 func (c *CommandActioner) Client() Client {
@@ -67,4 +66,20 @@ func (c *CommandActioner) GetResourceNamespace(input cli.Input, deprecatedFlag s
 
 	console.Verbose(2, "Namespace for resource %s ", currentNS)
 	return namespace, currentNS, nil
+}
+
+// ResolveNamespace returns the namespace a list command should operate in. It
+// applies the same precedence as GetResourceNamespace, then collapses to
+// metav1.NamespaceAll when --all-namespaces is set. This replaces the
+// GetResourceNamespace + AllNamespaces block that was duplicated across every
+// list command.
+func (c *CommandActioner) ResolveNamespace(input cli.Input, deprecatedFlag string) (string, error) {
+	_, namespace, err := c.GetResourceNamespace(input, deprecatedFlag)
+	if err != nil {
+		return "", err
+	}
+	if input.Bool(flagkey.AllNamespaces) {
+		namespace = metav1.NamespaceAll
+	}
+	return namespace, nil
 }

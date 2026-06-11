@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package builder
 
@@ -26,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -166,14 +153,14 @@ func (builder *Builder) Handler(w http.ResponseWriter, r *http.Request) {
 		"buildCommandLen", len(req.BuildCommand))
 
 	logger.V(1).Info("starting build")
-	srcPkgPath, err := utils.SanitizeFilePath(filepath.Join(builder.sharedVolumePath, req.SrcPkgFilename), builder.sharedVolumePath)
+	srcPkgPath, err := utils.RootJoin(builder.sharedVolumePath, req.SrcPkgFilename)
 	if err != nil {
 		logger.Error(err, "filename", req.SrcPkgFilename)
 		builder.reply(r.Context(), w, "", err.Error(), http.StatusBadRequest)
 		return
 	}
 	deployPkgFilename := fmt.Sprintf("%s-%s", req.SrcPkgFilename, strings.ToLower(uniuri.NewLen(6)))
-	deployPkgPath, err := utils.SanitizeFilePath(filepath.Join(builder.sharedVolumePath, deployPkgFilename), builder.sharedVolumePath)
+	deployPkgPath, err := utils.RootJoin(builder.sharedVolumePath, deployPkgFilename)
 	if err != nil {
 		logger.Error(err, "filename", req.SrcPkgFilename)
 		builder.reply(r.Context(), w, "", err.Error(), http.StatusBadRequest)
@@ -217,7 +204,7 @@ func (builder *Builder) Clean(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	srcPkgFilename := r.URL.Query().Get("name")
-	srcPkgPath, err := utils.SanitizeFilePath(filepath.Join(builder.sharedVolumePath, srcPkgFilename), builder.sharedVolumePath)
+	srcPkgPath, err := utils.RootJoin(builder.sharedVolumePath, srcPkgFilename)
 	if err != nil {
 		logger.Error(err, "rejecting clean request", "source_package", srcPkgFilename)
 		builder.reply(r.Context(), w, srcPkgFilename, fmt.Sprintf("error: invalid name: %s", err.Error()), http.StatusBadRequest)
@@ -230,7 +217,7 @@ func (builder *Builder) Clean(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		e := "error deleting src package after build"
 		logger.Error(err, e)
-		builder.reply(r.Context(), w, srcPkgFilename, "", http.StatusInternalServerError)
+		builder.reply(r.Context(), w, srcPkgFilename, fmt.Sprintf("%s: %s", e, err.Error()), http.StatusInternalServerError)
 		return
 	}
 
@@ -267,9 +254,9 @@ func (builder *Builder) build(ctx context.Context, command string, args []string
 
 	cmd := exec.Command(command, args...)
 
-	fi, err := os.Stat(srcPkgPath)
+	fi, err := utils.RootStat(builder.sharedVolumePath, srcPkgPath)
 	if err != nil {
-		return "", fmt.Errorf("could not find srcPkgPath: '%s'", srcPkgPath)
+		return "", fmt.Errorf("could not find srcPkgPath '%s': %w", srcPkgPath, err)
 	}
 	if fi.IsDir() {
 		cmd.Dir = srcPkgPath

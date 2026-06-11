@@ -6,7 +6,7 @@ metadata:
     chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
     svc: buildermgr
 spec:
-  replicas: 1
+  replicas: {{ dig "replicas" 1 (.Values.buildermgr | default dict) }}
   selector:
     matchLabels:
       svc: buildermgr
@@ -29,6 +29,7 @@ spec:
         command: ["/fission-bundle"]
         args: ["--builderMgr", "--storageSvcUrl", "http://storagesvc.{{ .Release.Namespace }}"]
         env:
+        {{- include "leaderElection.envs" (dict "enabled" (dig "leaderElection" "enabled" false (.Values.buildermgr | default dict))) | indent 8 }}
         - name: FETCHER_IMAGE
           value: {{ include "fetcherImage" . | quote }}
         - name: FETCHER_IMAGE_PULL_POLICY
@@ -57,16 +58,35 @@ spec:
         {{- include "kube_client.envs" . | indent 8 }}
         {{- include "opentelemtry.envs" . | indent 8 }}
         {{- include "internalAuth.envs" . | indent 8 }}
-        {{- if .Values.builderPodSpec.enabled }}
+        {{- include "coverage.envs" . | indent 8 }}
+        {{- if or .Values.builderPodSpec.enabled .Values.coverage.enabled }}
         volumeMounts:
+        {{- if .Values.builderPodSpec.enabled }}
         - name: builder-podspec-patch-volume
           mountPath: /etc/fission/builder-podspec-patch.yaml
           subPath: builder-podspec-patch.yaml
           readOnly: true
         {{- end }}
+        {{- include "coverage.volumemount" . | indent 8 }}
+        {{- end }}
         ports:
           - containerPort: 8080
             name: metrics
+          - containerPort: 8081
+            name: health
+        livenessProbe:
+          httpGet:
+            path: "/healthz"
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: "/readyz"
+            port: 8081
+          initialDelaySeconds: 1
+          periodSeconds: 5
+          failureThreshold: 30
         resources:
           {{- toYaml .Values.buildermgr.resources | nindent 10 }}
         {{- if .Values.terminationMessagePath }}
@@ -76,11 +96,14 @@ spec:
         terminationMessagePolicy: {{ .Values.terminationMessagePolicy }}
         {{- end }}
       serviceAccountName: fission-buildermgr
-      {{- if .Values.builderPodSpec.enabled }}
+      {{- if or .Values.builderPodSpec.enabled .Values.coverage.enabled }}
       volumes:
+      {{- if .Values.builderPodSpec.enabled }}
       - name: builder-podspec-patch-volume
         configMap:
           name: builder-podspec-patch
+      {{- end }}
+      {{- include "coverage.volume" . | indent 6 }}
       {{- end }}
 {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName }}

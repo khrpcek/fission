@@ -6,7 +6,11 @@ metadata:
     chart: "{{ .Chart.Name }}-{{ .Chart.Version }}"
     svc: executor
 spec:
-  replicas: 1
+  replicas: {{ .Values.executor.replicas | default 1 }}
+  {{- with .Values.executor.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       svc: executor
@@ -29,6 +33,16 @@ spec:
         command: ["/fission-bundle"]
         args: ["--executorPort", "8888"]
         env:
+        - name: LEADER_ELECTION_ENABLED
+          value: {{ .Values.executor.leaderElection.enabled | default false | quote }}
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: FETCHER_IMAGE
           value: {{ include "fetcherImage" . | quote }}
         - name: FETCHER_IMAGE_PULL_POLICY
@@ -37,6 +51,8 @@ spec:
           value: "{{ .Values.pullPolicy }}"
         - name: ADOPT_EXISTING_RESOURCES
           value: {{ .Values.executor.adoptExistingResources | default false | quote }}
+        - name: FINALIZER_ENABLED
+          value: {{ .Values.finalizerEnabled | quote }}
         - name: POD_READY_TIMEOUT
           value: {{ .Values.executor.podReadyTimeout | default false | quote }}
         - name: ENABLE_ISTIO
@@ -49,6 +65,22 @@ spec:
           value: {{ .Values.fetcher.resource.cpu.limits | quote }}
         - name: FETCHER_MAXMEM
           value: {{ .Values.fetcher.resource.mem.limits | quote }}
+        {{- if .Values.fetcher.allowInsecureRegistries }}
+        - name: FETCHER_ALLOW_INSECURE_REGISTRIES
+          value: {{ .Values.fetcher.allowInsecureRegistries | quote }}
+        {{- end }}
+        {{- if .Values.executor.enableOCIImageVolume }}
+        - name: ENABLE_OCI_IMAGE_VOLUME
+          value: {{ .Values.executor.enableOCIImageVolume | quote }}
+        {{- end }}
+        {{- if .Values.executor.functionServices.enabled }}
+        - name: ENABLE_FUNCTION_SERVICES
+          value: {{ .Values.executor.functionServices.enabled | quote }}
+        {{- end }}
+        {{- if .Values.executor.specializationConcurrency }}
+        - name: EXECUTOR_SPECIALIZATION_CONCURRENCY
+          value: {{ .Values.executor.specializationConcurrency | quote }}
+        {{- end }}
         - name: DEBUG_ENV
           value: {{ .Values.debugEnv | quote }}
         - name: PPROF_ENABLED
@@ -81,11 +113,12 @@ spec:
           value: {{ .Release.Name | quote }}
         {{- include "opentelemtry.envs" . | indent 8 }}
         {{- include "internalAuth.envs" . | indent 8 }}
+        {{- include "coverage.envs" . | indent 8 }}
         resources:
           {{- toYaml .Values.executor.resources | nindent 10 }}
         readinessProbe:
           httpGet:
-            path: "/healthz"
+            path: "/readyz"
             port: 8888
           initialDelaySeconds: 1
           periodSeconds: 1
@@ -96,12 +129,15 @@ spec:
             port: 8888
           initialDelaySeconds: 35
           periodSeconds: 5
-        {{- if .Values.runtimePodSpec.enabled }}
+        {{- if or .Values.runtimePodSpec.enabled .Values.coverage.enabled }}
         volumeMounts:
+        {{- if .Values.runtimePodSpec.enabled }}
         - name: runtime-podspec-patch-volume
           mountPath: /etc/fission/runtime-podspec-patch.yaml
           subPath: runtime-podspec-patch.yaml
           readOnly: true
+        {{- end }}
+        {{- include "coverage.volumemount" . | indent 8 }}
         {{- end }}
         ports:
         - containerPort: 8080
@@ -123,11 +159,17 @@ spec:
         terminationMessagePolicy: {{ .Values.terminationMessagePolicy }}
         {{- end }}
       serviceAccountName: fission-executor
-      {{- if .Values.runtimePodSpec.enabled }}
+      {{- with .Values.executor.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
+      {{- if or .Values.runtimePodSpec.enabled .Values.coverage.enabled }}
       volumes:
+      {{- if .Values.runtimePodSpec.enabled }}
       - name: runtime-podspec-patch-volume
         configMap:
           name: runtime-podspec-patch
+      {{- end }}
+      {{- include "coverage.volume" . | indent 6 }}
       {{- end }}
 {{- if .Values.executor.priorityClassName }}
       priorityClassName: {{ .Values.executor.priorityClassName }}

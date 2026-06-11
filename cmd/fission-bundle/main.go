@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package main
 
@@ -23,6 +11,7 @@ import (
 	"os"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	cnwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
@@ -35,13 +24,13 @@ import (
 	"github.com/fission/fission/pkg/info"
 	"github.com/fission/fission/pkg/kubewatcher"
 	functionLogger "github.com/fission/fission/pkg/logger"
+	"github.com/fission/fission/pkg/mcp"
 	mqt "github.com/fission/fission/pkg/mqtrigger"
 	"github.com/fission/fission/pkg/router"
 	"github.com/fission/fission/pkg/storagesvc"
 	storagesvcClient "github.com/fission/fission/pkg/storagesvc/client"
 	"github.com/fission/fission/pkg/timer"
 	"github.com/fission/fission/pkg/utils/loggerfactory"
-	"github.com/fission/fission/pkg/utils/manager"
 	"github.com/fission/fission/pkg/utils/otel"
 	"github.com/fission/fission/pkg/utils/profile"
 	"github.com/fission/fission/pkg/webhook"
@@ -65,6 +54,7 @@ type CommandLineArgs struct {
 	routerInternalPort int
 	executorPort       int
 	storageServicePort int
+	mcpPort            int
 
 	// URL values
 	executorUrl   string
@@ -125,8 +115,8 @@ Options:
   --version                       Print version information`
 
 func main() {
-	mgr := manager.New()
-	defer mgr.Wait()
+	mgr := &errgroup.Group{}
+	defer func() { _ = mgr.Wait() }()
 
 	// Set up command line parsing
 	args := setupCommandLineArgs()
@@ -195,6 +185,7 @@ func setupCommandLineArgs() *CommandLineArgs {
 	flag.IntVar(&args.routerInternalPort, "routerInternalPort", router.DefaultInternalListenerPort, "Port for the router internal listener that serves /fission-function/<ns>/<name>")
 	flag.IntVar(&args.executorPort, "executorPort", 0, "Port that the executor should listen on")
 	flag.IntVar(&args.storageServicePort, "storageServicePort", 0, "Port that the storage service should listen on")
+	flag.IntVar(&args.mcpPort, "mcpPort", 0, "Port that the MCP tool server should listen on")
 
 	// URL flags
 	flag.StringVar(&args.executorUrl, "executorUrl", "http://executor.fission", "Executor URL")
@@ -230,13 +221,15 @@ func getServiceNameFromArgs(args *CommandLineArgs) string {
 		serviceName = "Fission-StorageSvc"
 	} else if args.mqt_keda {
 		serviceName = "Fission-Keda-MQTrigger"
+	} else if args.mcpPort != 0 {
+		serviceName = "Fission-MCP"
 	}
 
 	return serviceName
 }
 
 // startRequestedService starts the service specified by command line arguments
-func startRequestedService(ctx context.Context, args *CommandLineArgs, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr manager.Interface) {
+func startRequestedService(ctx context.Context, args *CommandLineArgs, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr *errgroup.Group) {
 	var err error
 
 	// Start the requested service based on command line arguments
@@ -314,6 +307,17 @@ func startRequestedService(ctx context.Context, args *CommandLineArgs, clientGen
 		return
 	}
 
+	if args.mcpPort != 0 {
+		// The MCP server proxies tools/call to /fission-function/... on the
+		// router internal listener, so it takes the same resolved publishURL
+		// (ROUTER_INTERNAL_URL) as kubewatcher/timer/mqt.
+		err = mcp.Start(ctx, clientGen, logger, mgr, args.mcpPort, publishURL)
+		if err != nil {
+			logger.Error(err, "mcp server exited")
+		}
+		return
+	}
+
 	if args.builderMgr {
 		err = buildermgr.Start(ctx, clientGen, logger, mgr, args.storageSvcUrl)
 		if err != nil {
@@ -337,7 +341,7 @@ func startRequestedService(ctx context.Context, args *CommandLineArgs, clientGen
 }
 
 // startStorageService initializes and starts the storage service
-func startStorageService(ctx context.Context, args *CommandLineArgs, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr manager.Interface) {
+func startStorageService(ctx context.Context, args *CommandLineArgs, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr *errgroup.Group) {
 	var storage storagesvc.Storage
 
 	if args.storageType == string(storagesvc.StorageTypeS3) {

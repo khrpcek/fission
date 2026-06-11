@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.0
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: environments.fission.io
 spec:
   group: fission.io
@@ -53,6 +53,9 @@ spec:
                   Available value:
                   - single
                   - infinite
+                enum:
+                - single
+                - infinite
                 type: string
               builder:
                 description: |-
@@ -1175,7 +1178,6 @@ spec:
                               procMount denotes the type of proc mount to use for the containers.
                               The default value is Default which uses the container runtime defaults for
                               readonly paths and masked paths.
-                              This requires the ProcMountType feature flag to be enabled.
                               Note that this field cannot be set when spec.os.name is windows.
                             type: string
                           readOnlyRootFilesystem:
@@ -3657,7 +3659,6 @@ spec:
                                     procMount denotes the type of proc mount to use for the containers.
                                     The default value is Default which uses the container runtime defaults for
                                     readonly paths and masked paths.
-                                    This requires the ProcMountType feature flag to be enabled.
                                     Note that this field cannot be set when spec.os.name is windows.
                                   type: string
                                 readOnlyRootFilesystem:
@@ -5228,7 +5229,6 @@ spec:
                                     procMount denotes the type of proc mount to use for the containers.
                                     The default value is Default which uses the container runtime defaults for
                                     readonly paths and masked paths.
-                                    This requires the ProcMountType feature flag to be enabled.
                                     Note that this field cannot be set when spec.os.name is windows.
                                   type: string
                                 readOnlyRootFilesystem:
@@ -5712,7 +5712,6 @@ spec:
                           When set to false, a new userns is created for the pod. Setting false is useful for
                           mitigating container breakout vulnerabilities even allowing users to run their
                           containers as root without actually having root privileges on the host.
-                          This field is alpha-level and is only honored by servers that enable the UserNamespacesSupport feature.
                         type: boolean
                       hostname:
                         description: |-
@@ -6882,7 +6881,6 @@ spec:
                                     procMount denotes the type of proc mount to use for the containers.
                                     The default value is Default which uses the container runtime defaults for
                                     readonly paths and masked paths.
-                                    This requires the ProcMountType feature flag to be enabled.
                                     Note that this field cannot be set when spec.os.name is windows.
                                   type: string
                                 readOnlyRootFilesystem:
@@ -7451,6 +7449,14 @@ spec:
 
                             It adds a name to it that uniquely identifies the ResourceClaim inside the Pod.
                             Containers that need access to the ResourceClaim reference it with this name.
+
+                            When the DRAWorkloadResourceClaims feature gate is enabled and this Pod
+                            belongs to a PodGroup, a PodResourceClaim is matched to a
+                            PodGroupResourceClaim if all of their fields are equal (Name,
+                            ResourceClaimName, and ResourceClaimTemplateName). A matched claim references
+                            a single ResourceClaim shared across all Pods in the PodGroup, reserved for
+                            the PodGroup in ResourceClaimStatus.ReservedFor rather than for individual
+                            Pods.
                           properties:
                             name:
                               description: |-
@@ -7475,6 +7481,16 @@ spec:
                                 will also be deleted. The pod name and resource name, along with a
                                 generated component, will be used to form a unique name for the
                                 ResourceClaim, which will be recorded in pod.status.resourceClaimStatuses.
+
+                                When the DRAWorkloadResourceClaims feature gate is enabled and the pod
+                                belongs to a PodGroup that defines a PodGroupResourceClaim with the same
+                                Name and ResourceClaimTemplateName, this PodResourceClaim resolves to the
+                                ResourceClaim generated for the PodGroup. All pods in the group that
+                                define an equivalent PodResourceClaim matching the
+                                PodGroupResourceClaim's Name and ResourceClaimTemplateName share the same
+                                generated ResourceClaim. ResourceClaims generated for a PodGroup are
+                                owned by the PodGroup and their lifecycles are tied to the PodGroup
+                                instead of any individual pod.
 
                                 This field is immutable and no changes will be made to the
                                 corresponding ResourceClaim by the control plane after creating the
@@ -7601,6 +7617,28 @@ spec:
                         x-kubernetes-list-map-keys:
                         - name
                         x-kubernetes-list-type: map
+                      schedulingGroup:
+                        description: |-
+                          SchedulingGroup provides a reference to the immediate scheduling runtime
+                          grouping object that this Pod belongs to.
+                          This field is used by the scheduler to identify the group and apply the
+                          correct group scheduling policies. The association with a group also
+                          impacts other lifecycle aspects of a Pod that are relevant in a wider context
+                          of scheduling like preemption, resource attachment, etc. If not specified,
+                          the Pod is treated as a single unit in all of these aspects.
+                          The group object referenced by this field may not exist at the time the
+                          Pod is created.
+                          This field is immutable, but a group object with the same name may be
+                          recreated with different policies. Doing this during pod scheduling
+                          may result in the placement not conforming to the expected policies.
+                        properties:
+                          podGroupName:
+                            description: |-
+                              PodGroupName specifies the name of the standalone PodGroup object
+                              that represents the runtime instance of this group.
+                              Must be a DNS subdomain.
+                            type: string
+                        type: object
                       securityContext:
                         description: |-
                           SecurityContext holds pod-level security attributes and common container settings.
@@ -9029,7 +9067,7 @@ spec:
                                 A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                                 The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                                 The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                                The volume will be mounted read-only (ro) and non-executable files (noexec).
+                                The volume will be mounted read-only (ro).
                                 Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                                 The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                               properties:
@@ -9201,8 +9239,7 @@ spec:
                               description: |-
                                 portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                                 Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                                are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                                is on.
+                                are redirected to the pxd.portworx.com CSI driver.
                               properties:
                                 fsType:
                                   description: |-
@@ -10025,46 +10062,39 @@ spec:
                         x-kubernetes-list-map-keys:
                         - name
                         x-kubernetes-list-type: map
-                      workloadRef:
-                        description: |-
-                          WorkloadRef provides a reference to the Workload object that this Pod belongs to.
-                          This field is used by the scheduler to identify the PodGroup and apply the
-                          correct group scheduling policies. The Workload object referenced
-                          by this field may not exist at the time the Pod is created.
-                          This field is immutable, but a Workload object with the same name
-                          may be recreated with different policies. Doing this during pod scheduling
-                          may result in the placement not conforming to the expected policies.
-                        properties:
-                          name:
-                            description: |-
-                              Name defines the name of the Workload object this Pod belongs to.
-                              Workload must be in the same namespace as the Pod.
-                              If it doesn't match any existing Workload, the Pod will remain unschedulable
-                              until a Workload object is created and observed by the kube-scheduler.
-                              It must be a DNS subdomain.
-                            type: string
-                          podGroup:
-                            description: |-
-                              PodGroup is the name of the PodGroup within the Workload that this Pod
-                              belongs to. If it doesn't match any existing PodGroup within the Workload,
-                              the Pod will remain unschedulable until the Workload object is recreated
-                              and observed by the kube-scheduler. It must be a DNS label.
-                            type: string
-                          podGroupReplicaKey:
-                            description: |-
-                              PodGroupReplicaKey specifies the replica key of the PodGroup to which this
-                              Pod belongs. It is used to distinguish pods belonging to different replicas
-                              of the same pod group. The pod group policy is applied separately to each replica.
-                              When set, it must be a DNS label.
-                            type: string
-                        required:
-                        - name
-                        - podGroup
-                        type: object
                     required:
                     - containers
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: spec.builder.podspec.hostNetwork is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.hostNetwork) || !self.podspec.hostNetwork'
+                - message: spec.builder.podspec.hostPID is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.hostPID) || !self.podspec.hostPID'
+                - message: spec.builder.podspec.hostIPC is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.hostIPC) || !self.podspec.hostIPC'
+                - message: spec.builder.podspec.serviceAccountName override is not
+                    allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.serviceAccountName)
+                    || self.podspec.serviceAccountName == '''''
+                - message: spec.builder.podspec.serviceAccount override is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.serviceAccount) ||
+                    self.podspec.serviceAccount == '''''
+                - message: spec.builder.container.securityContext.privileged=true
+                    is not allowed
+                  rule: '!has(self.container) || !has(self.container.securityContext)
+                    || !has(self.container.securityContext.privileged) || !self.container.securityContext.privileged'
+                - message: spec.builder.container.securityContext.allowPrivilegeEscalation=true
+                    is not allowed
+                  rule: '!has(self.container) || !has(self.container.securityContext)
+                    || !has(self.container.securityContext.allowPrivilegeEscalation)
+                    || !self.container.securityContext.allowPrivilegeEscalation'
+                - message: spec.builder.container.securityContext.capabilities.add
+                    may only contain NET_BIND_SERVICE (PSA restricted)
+                  rule: '!has(self.container) || !has(self.container.securityContext)
+                    || !has(self.container.securityContext.capabilities) || !has(self.container.securityContext.capabilities.add)
+                    || self.container.securityContext.capabilities.add.all(c, c ==
+                    ''NET_BIND_SERVICE'')'
               imagepullsecret:
                 description: |-
                   ImagePullSecret is the secret for Kubernetes to pull an image from a
@@ -10078,6 +10108,7 @@ spec:
                 type: boolean
               poolsize:
                 description: The initial pool size for environment
+                minimum: 0
                 type: integer
               resources:
                 description: |-
@@ -11257,7 +11288,6 @@ spec:
                               procMount denotes the type of proc mount to use for the containers.
                               The default value is Default which uses the container runtime defaults for
                               readonly paths and masked paths.
-                              This requires the ProcMountType feature flag to be enabled.
                               Note that this field cannot be set when spec.os.name is windows.
                             type: string
                           readOnlyRootFilesystem:
@@ -13747,7 +13777,6 @@ spec:
                                     procMount denotes the type of proc mount to use for the containers.
                                     The default value is Default which uses the container runtime defaults for
                                     readonly paths and masked paths.
-                                    This requires the ProcMountType feature flag to be enabled.
                                     Note that this field cannot be set when spec.os.name is windows.
                                   type: string
                                 readOnlyRootFilesystem:
@@ -15318,7 +15347,6 @@ spec:
                                     procMount denotes the type of proc mount to use for the containers.
                                     The default value is Default which uses the container runtime defaults for
                                     readonly paths and masked paths.
-                                    This requires the ProcMountType feature flag to be enabled.
                                     Note that this field cannot be set when spec.os.name is windows.
                                   type: string
                                 readOnlyRootFilesystem:
@@ -15802,7 +15830,6 @@ spec:
                           When set to false, a new userns is created for the pod. Setting false is useful for
                           mitigating container breakout vulnerabilities even allowing users to run their
                           containers as root without actually having root privileges on the host.
-                          This field is alpha-level and is only honored by servers that enable the UserNamespacesSupport feature.
                         type: boolean
                       hostname:
                         description: |-
@@ -16972,7 +16999,6 @@ spec:
                                     procMount denotes the type of proc mount to use for the containers.
                                     The default value is Default which uses the container runtime defaults for
                                     readonly paths and masked paths.
-                                    This requires the ProcMountType feature flag to be enabled.
                                     Note that this field cannot be set when spec.os.name is windows.
                                   type: string
                                 readOnlyRootFilesystem:
@@ -17541,6 +17567,14 @@ spec:
 
                             It adds a name to it that uniquely identifies the ResourceClaim inside the Pod.
                             Containers that need access to the ResourceClaim reference it with this name.
+
+                            When the DRAWorkloadResourceClaims feature gate is enabled and this Pod
+                            belongs to a PodGroup, a PodResourceClaim is matched to a
+                            PodGroupResourceClaim if all of their fields are equal (Name,
+                            ResourceClaimName, and ResourceClaimTemplateName). A matched claim references
+                            a single ResourceClaim shared across all Pods in the PodGroup, reserved for
+                            the PodGroup in ResourceClaimStatus.ReservedFor rather than for individual
+                            Pods.
                           properties:
                             name:
                               description: |-
@@ -17565,6 +17599,16 @@ spec:
                                 will also be deleted. The pod name and resource name, along with a
                                 generated component, will be used to form a unique name for the
                                 ResourceClaim, which will be recorded in pod.status.resourceClaimStatuses.
+
+                                When the DRAWorkloadResourceClaims feature gate is enabled and the pod
+                                belongs to a PodGroup that defines a PodGroupResourceClaim with the same
+                                Name and ResourceClaimTemplateName, this PodResourceClaim resolves to the
+                                ResourceClaim generated for the PodGroup. All pods in the group that
+                                define an equivalent PodResourceClaim matching the
+                                PodGroupResourceClaim's Name and ResourceClaimTemplateName share the same
+                                generated ResourceClaim. ResourceClaims generated for a PodGroup are
+                                owned by the PodGroup and their lifecycles are tied to the PodGroup
+                                instead of any individual pod.
 
                                 This field is immutable and no changes will be made to the
                                 corresponding ResourceClaim by the control plane after creating the
@@ -17691,6 +17735,28 @@ spec:
                         x-kubernetes-list-map-keys:
                         - name
                         x-kubernetes-list-type: map
+                      schedulingGroup:
+                        description: |-
+                          SchedulingGroup provides a reference to the immediate scheduling runtime
+                          grouping object that this Pod belongs to.
+                          This field is used by the scheduler to identify the group and apply the
+                          correct group scheduling policies. The association with a group also
+                          impacts other lifecycle aspects of a Pod that are relevant in a wider context
+                          of scheduling like preemption, resource attachment, etc. If not specified,
+                          the Pod is treated as a single unit in all of these aspects.
+                          The group object referenced by this field may not exist at the time the
+                          Pod is created.
+                          This field is immutable, but a group object with the same name may be
+                          recreated with different policies. Doing this during pod scheduling
+                          may result in the placement not conforming to the expected policies.
+                        properties:
+                          podGroupName:
+                            description: |-
+                              PodGroupName specifies the name of the standalone PodGroup object
+                              that represents the runtime instance of this group.
+                              Must be a DNS subdomain.
+                            type: string
+                        type: object
                       securityContext:
                         description: |-
                           SecurityContext holds pod-level security attributes and common container settings.
@@ -19119,7 +19185,7 @@ spec:
                                 A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                                 The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                                 The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                                The volume will be mounted read-only (ro) and non-executable files (noexec).
+                                The volume will be mounted read-only (ro).
                                 Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                                 The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                               properties:
@@ -19291,8 +19357,7 @@ spec:
                               description: |-
                                 portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                                 Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                                are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                                is on.
+                                are redirected to the pxd.portworx.com CSI driver.
                               properties:
                                 fsType:
                                   description: |-
@@ -20115,53 +20180,47 @@ spec:
                         x-kubernetes-list-map-keys:
                         - name
                         x-kubernetes-list-type: map
-                      workloadRef:
-                        description: |-
-                          WorkloadRef provides a reference to the Workload object that this Pod belongs to.
-                          This field is used by the scheduler to identify the PodGroup and apply the
-                          correct group scheduling policies. The Workload object referenced
-                          by this field may not exist at the time the Pod is created.
-                          This field is immutable, but a Workload object with the same name
-                          may be recreated with different policies. Doing this during pod scheduling
-                          may result in the placement not conforming to the expected policies.
-                        properties:
-                          name:
-                            description: |-
-                              Name defines the name of the Workload object this Pod belongs to.
-                              Workload must be in the same namespace as the Pod.
-                              If it doesn't match any existing Workload, the Pod will remain unschedulable
-                              until a Workload object is created and observed by the kube-scheduler.
-                              It must be a DNS subdomain.
-                            type: string
-                          podGroup:
-                            description: |-
-                              PodGroup is the name of the PodGroup within the Workload that this Pod
-                              belongs to. If it doesn't match any existing PodGroup within the Workload,
-                              the Pod will remain unschedulable until the Workload object is recreated
-                              and observed by the kube-scheduler. It must be a DNS label.
-                            type: string
-                          podGroupReplicaKey:
-                            description: |-
-                              PodGroupReplicaKey specifies the replica key of the PodGroup to which this
-                              Pod belongs. It is used to distinguish pods belonging to different replicas
-                              of the same pod group. The pod group policy is applied separately to each replica.
-                              When set, it must be a DNS label.
-                            type: string
-                        required:
-                        - name
-                        - podGroup
-                        type: object
                     required:
                     - containers
                     type: object
                 required:
                 - image
                 type: object
+                x-kubernetes-validations:
+                - message: spec.runtime.podspec.hostNetwork is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.hostNetwork) || !self.podspec.hostNetwork'
+                - message: spec.runtime.podspec.hostPID is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.hostPID) || !self.podspec.hostPID'
+                - message: spec.runtime.podspec.hostIPC is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.hostIPC) || !self.podspec.hostIPC'
+                - message: spec.runtime.podspec.serviceAccountName override is not
+                    allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.serviceAccountName)
+                    || self.podspec.serviceAccountName == '''''
+                - message: spec.runtime.podspec.serviceAccount override is not allowed
+                  rule: '!has(self.podspec) || !has(self.podspec.serviceAccount) ||
+                    self.podspec.serviceAccount == '''''
+                - message: spec.runtime.container.securityContext.privileged=true
+                    is not allowed
+                  rule: '!has(self.container) || !has(self.container.securityContext)
+                    || !has(self.container.securityContext.privileged) || !self.container.securityContext.privileged'
+                - message: spec.runtime.container.securityContext.allowPrivilegeEscalation=true
+                    is not allowed
+                  rule: '!has(self.container) || !has(self.container.securityContext)
+                    || !has(self.container.securityContext.allowPrivilegeEscalation)
+                    || !self.container.securityContext.allowPrivilegeEscalation'
+                - message: spec.runtime.container.securityContext.capabilities.add
+                    may only contain NET_BIND_SERVICE (PSA restricted)
+                  rule: '!has(self.container) || !has(self.container.securityContext)
+                    || !has(self.container.securityContext.capabilities) || !has(self.container.securityContext.capabilities.add)
+                    || self.container.securityContext.capabilities.add.all(c, c ==
+                    ''NET_BIND_SERVICE'')'
               terminationGracePeriod:
                 description: |-
                   The grace time for pod to perform connection draining before termination. The unit is in seconds.
                   (Optional) defaults to 360 seconds
                 format: int64
+                minimum: 0
                 type: integer
               version:
                 description: |-
@@ -20173,7 +20232,12 @@ spec:
                   Version "2" supports downloading and compiling user function if source archive is not empty.
 
                   Version "3" is almost the same with v2, but you're able to control the size of pre-warm pool of the environment.
+                maximum: 3
+                minimum: 1
                 type: integer
+                x-kubernetes-validations:
+                - message: spec.version is immutable
+                  rule: self == oldSelf
             required:
             - runtime
             - version

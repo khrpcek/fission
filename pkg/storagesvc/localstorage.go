@@ -1,10 +1,11 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package storagesvc
 
 import (
 	"os"
-
-	"github.com/graymeta/stow"
-	_ "github.com/graymeta/stow/local"
 
 	"github.com/fission/fission/pkg/utils/uuid"
 )
@@ -47,7 +48,6 @@ func (ls localStorage) getContainerName() string {
 	return ls.containerName
 }
 
-func (ls localStorage) dial() (stow.Location, error) {
-	cfg := stow.ConfigMap{"path": ls.localPath}
-	return stow.Dial("local", cfg)
+func (ls localStorage) dial() (objectStore, error) {
+	return newLocalObjectStore(ls.localPath, ls.containerName)
 }

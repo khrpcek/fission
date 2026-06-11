@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build integration
 
 // Package framework is the test harness for Go integration tests that run
@@ -47,7 +51,11 @@ type Framework struct {
 	// signing (matches the chart's pass-through mode when
 	// internalAuth.enabled=false).
 	internalAuthSecret []byte
-	logger             logr.Logger
+	// mcpBaseURL is the URL of the MCP server (svc/mcp). Sourced from
+	// FISSION_MCP_BASE_URL via mcpBaseURLFromEnv (default
+	// http://127.0.0.1:8890 to match the suite-bootstrap port-forward).
+	mcpBaseURL string
+	logger     logr.Logger
 }
 
 var (
@@ -90,6 +98,7 @@ func newFramework() (*Framework, error) {
 		router:             routerURLFromEnv(),
 		routerInternal:     routerInternalURLFromEnv(),
 		internalAuthSecret: internalAuthSecretFromEnv(),
+		mcpBaseURL:         mcpBaseURLFromEnv(),
 		logger:             loggerfactory.GetLogger(),
 	}, nil
 }
@@ -122,3 +131,9 @@ func (f *Framework) RouterInternalBaseURL() string { return f.routerInternal }
 // emit unsigned requests in that case (the verifier short-circuits to
 // pass-through).
 func (f *Framework) InternalAuthSecret() []byte { return f.internalAuthSecret }
+
+// MCPBaseURL returns the URL of the MCP server (svc/mcp). MCP integration tests
+// dial "<base>/mcp"; they should skip when the endpoint is unreachable (the MCP
+// subsystem is enabled in the kind/kind-ci skaffold profiles but may be off in
+// other installs).
+func (f *Framework) MCPBaseURL() string { return f.mcpBaseURL }

@@ -1,18 +1,6 @@
-/*
-Copyright 2017 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package storagesvc
 
@@ -29,13 +17,12 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/gorilla/mux"
-	"github.com/graymeta/stow"
+	"golang.org/x/sync/errgroup"
 
 	hmacauth "github.com/fission/fission/pkg/auth/hmac"
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/utils/httpsecurity"
 	"github.com/fission/fission/pkg/utils/httpserver"
-	"github.com/fission/fission/pkg/utils/manager"
 	"github.com/fission/fission/pkg/utils/metrics"
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
@@ -44,7 +31,7 @@ type (
 	// Storage is an interface to force storage level details implementation.
 	Storage interface {
 		getStorageType() StorageType
-		dial() (stow.Location, error)
+		dial() (objectStore, error)
 		getSubDir() string
 		getContainerName() string
 		getUploadFileName() (string, error)
@@ -53,7 +40,7 @@ type (
 	// StorageService is a struct to hold all things for storage service
 	StorageService struct {
 		logger        logr.Logger
-		storageClient *StowClient
+		storageClient *StorageClient
 		port          int
 		// authSecret, if non-empty, enables HMAC enforcement on /v1/archive.
 		authSecret []byte
@@ -69,10 +56,6 @@ type (
 // Functions handling storage interface
 func getStorageType(storage Storage) string {
 	return string(storage.getStorageType())
-}
-
-func getStorageLocation(config *storageConfig) (stow.Location, error) {
-	return config.storage.dial()
 }
 
 func (ss *StorageService) listItems(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +99,7 @@ func (ss *StorageService) uploadHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	defer file.Close()
 
-	// stow wants the file size, but that's different from the
+	// the backend needs the file size, but that's different from the
 	// content length, the content length being the size of the
 	// encoded file in the HTTP request. So we require an
 	// "X-File-Size" header in bytes.
@@ -214,8 +197,7 @@ func (ss *StorageService) downloadHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Get the file (called "item" in stow's jargon), open it,
-	// stream it to response
+	// Get the file, open it, and stream it to the response.
 	err = ss.storageClient.copyFileToStream(fileId, w)
 	if err != nil {
 		logger.Error(err, "error getting file from storage client", "file_id", fileId)
@@ -224,8 +206,6 @@ func (ss *StorageService) downloadHandler(w http.ResponseWriter, r *http.Request
 			http.Error(w, "Error retrieving item: not found", http.StatusNotFound)
 		case ErrRetrievingItem:
 			http.Error(w, "Error retrieving item", http.StatusBadRequest)
-		case ErrOpeningItem:
-			http.Error(w, "Error opening item", http.StatusBadRequest)
 		case ErrWritingFileIntoResponse:
 			http.Error(w, "Error writing response", http.StatusInternalServerError)
 		}
@@ -241,7 +221,7 @@ func (ss *StorageService) infoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = ss.storageClient.container.Item(fileID)
+	err = ss.storageClient.exists(fileID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -258,7 +238,7 @@ func (ss *StorageService) healthHandler(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
-func MakeStorageService(logger logr.Logger, storageClient *StowClient, port int, authSecret, authSecretOld []byte) *StorageService {
+func MakeStorageService(logger logr.Logger, storageClient *StorageClient, port int, authSecret, authSecretOld []byte) *StorageService {
 	return &StorageService{
 		logger:        logger.WithName("storage_service"),
 		storageClient: storageClient,
@@ -268,7 +248,7 @@ func MakeStorageService(logger logr.Logger, storageClient *StowClient, port int,
 	}
 }
 
-func (ss *StorageService) Start(ctx context.Context, mgr manager.Interface, port int) {
+func (ss *StorageService) Start(ctx context.Context, mgr *errgroup.Group, port int) {
 	r := mux.NewRouter()
 	if len(ss.authSecret) > 0 {
 		// HMAC enforcement is opt-in via the FISSION_INTERNAL_AUTH_SECRET env
@@ -312,16 +292,16 @@ func (ss *StorageService) Start(ctx context.Context, mgr manager.Interface, port
 }
 
 // Start runs storage service
-func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, storage Storage, mgr manager.Interface, port int) error {
+func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, storage Storage, mgr *errgroup.Group, port int) error {
 	enablePruner, err := strconv.ParseBool(os.Getenv("PRUNE_ENABLED"))
 	if err != nil {
 		logger.Error(err, "PRUNE_ENABLED value not set. Enabling archive pruner by default.")
 		enablePruner = true
 	}
 	// create a storage client
-	storageClient, err := MakeStowClient(logger, storage)
+	storageClient, err := MakeStorageClient(logger, storage)
 	if err != nil {
-		return fmt.Errorf("error creating stowClient: %w", err)
+		return fmt.Errorf("error creating storageClient: %w", err)
 	}
 
 	// Read the shared HMAC secret from the env (the design at docs/internal-auth/00-design.md). Empty means the
@@ -331,12 +311,14 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 
 	// create http handlers
 	storageService := MakeStorageService(logger, storageClient, port, authSecret, authSecretOld)
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		metrics.ServeMetrics(ctx, "storagesvc", logger, mgr)
+		return nil
 	})
 
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		storageService.Start(ctx, mgr, port)
+		return nil
 	})
 
 	// enablePruner prevents storagesvc unit test from needing to talk to kubernetes
@@ -350,8 +332,9 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		if err != nil {
 			return fmt.Errorf("error creating archivePruner: %w", err)
 		}
-		mgr.Add(ctx, func(ctx context.Context) {
+		mgr.Go(func() error {
 			pruner.Start(ctx, mgr)
+			return nil
 		})
 	}
 

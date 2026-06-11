@@ -1,11 +1,12 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package storagesvc
 
 import (
 	"os"
 	"path"
-
-	"github.com/graymeta/stow"
-	"github.com/graymeta/stow/s3"
 
 	"github.com/fission/fission/pkg/utils/uuid"
 )
@@ -59,14 +60,6 @@ func (ss s3Storage) getUploadFileName() (string, error) {
 	return path.Join(ss.subDir, id), nil
 }
 
-func (ss s3Storage) dial() (stow.Location, error) {
-	kind := "s3"
-	config := stow.ConfigMap{
-		s3.ConfigEndpoint:    ss.endpoint,
-		s3.ConfigAccessKeyID: ss.accessKeyID,
-		s3.ConfigSecretKey:   ss.secretAccessKey,
-		s3.ConfigRegion:      ss.region,
-		s3.ConfigDisableSSL:  "true",
-	}
-	return stow.Dial(kind, config)
+func (ss s3Storage) dial() (objectStore, error) {
+	return newS3ObjectStore(ss.endpoint, ss.accessKeyID, ss.secretAccessKey, ss.region, ss.bucketName)
 }

@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package canaryconfig
 
@@ -51,35 +39,43 @@ func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 	if err != nil {
 		return fmt.Errorf("error updating canary config: %w", err)
 	}
-	incrementStep := input.Int(flagkey.CanaryWeightIncrement)
-	failureThreshold := input.Int(flagkey.CanaryFailureThreshold)
-	incrementInterval := input.String(flagkey.CanaryIncrementInterval)
-
-	// check for time parsing
-	_, err = time.ParseDuration(incrementInterval)
-	if err != nil {
-		return fmt.Errorf("error parsing time duration: %w", err)
-	}
-
 	canaryCfg, err := opts.Client().FissionClientSet.CoreV1().CanaryConfigs(ns).Get(input.Context(), input.String(flagkey.CanaryName), metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error getting canary config: %w", err)
 	}
 
+	// Only flags the user actually set should mutate the resource; these flags
+	// have non-zero defaults, so comparing the raw value would clobber stored
+	// fields (and reset status) on an update that never mentioned them.
 	var updateNeeded bool
 
-	if incrementStep != canaryCfg.Spec.WeightIncrement {
-		canaryCfg.Spec.WeightIncrement = incrementStep
+	if input.IsSet(flagkey.CanaryWeightIncrement) {
+		if incrementStep := input.Int(flagkey.CanaryWeightIncrement); incrementStep != canaryCfg.Spec.WeightIncrement {
+			canaryCfg.Spec.WeightIncrement = incrementStep
+			updateNeeded = true
+		}
 	}
 
-	if failureThreshold != canaryCfg.Spec.FailureThreshold {
-		canaryCfg.Spec.FailureThreshold = failureThreshold
+	if input.IsSet(flagkey.CanaryFailureThreshold) {
+		if failureThreshold := input.Int(flagkey.CanaryFailureThreshold); failureThreshold != canaryCfg.Spec.FailureThreshold {
+			canaryCfg.Spec.FailureThreshold = failureThreshold
+			updateNeeded = true
+		}
 	}
 
-	if incrementInterval != canaryCfg.Spec.WeightIncrementDuration {
-		canaryCfg.Spec.WeightIncrementDuration = incrementInterval
+	if input.IsSet(flagkey.CanaryIncrementInterval) {
+		incrementInterval := input.String(flagkey.CanaryIncrementInterval)
+		if _, err := time.ParseDuration(incrementInterval); err != nil {
+			return fmt.Errorf("error parsing time duration: %w", err)
+		}
+		if incrementInterval != canaryCfg.Spec.WeightIncrementDuration {
+			canaryCfg.Spec.WeightIncrementDuration = incrementInterval
+			updateNeeded = true
+		}
 	}
 
+	// When any spec field changed, re-arm the rollout by resetting the status to
+	// pending so the canary controller re-evaluates from the start.
 	if updateNeeded {
 		canaryCfg.Status.Status = fv1.CanaryConfigStatusPending
 	}

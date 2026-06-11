@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package httptrigger
 
@@ -56,7 +44,7 @@ func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 
 	_, triggerNamespace, err := opts.GetResourceNamespace(input, flagkey.NamespaceTrigger)
 	if err != nil {
-		return fmt.Errorf("error in deleting function : %w", err)
+		return fmt.Errorf("error in updating HTTP trigger : %w", err)
 	}
 
 	ht, err := opts.Client().FissionClientSet.CoreV1().HTTPTriggers(triggerNamespace).Get(input.Context(), htName, metav1.GetOptions{})
@@ -139,6 +127,7 @@ func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 			ht.Spec.IngressConfig.IngressClassName = &className
 		}
 	}
+	warnIngressDeprecated(input)
 
 	if input.IsSet(flagkey.HtIngressRule) || input.IsSet(flagkey.HtIngressAnnotation) || input.IsSet(flagkey.HtIngressTLS) {
 		fallbackURL := ""
@@ -154,6 +143,61 @@ func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 			return fmt.Errorf("error parsing ingress configuration: %w", err)
 		}
 		ht.Spec.IngressConfig = *ingress
+	}
+
+	if input.IsSet(flagkey.HtRouteProvider) || input.IsSet(flagkey.HtRouteHost) ||
+		input.IsSet(flagkey.HtRoutePath) || input.IsSet(flagkey.HtRouteAnnotation) ||
+		input.IsSet(flagkey.HtRouteTLS) || input.IsSet(flagkey.HtGateway) {
+		// Merge into the existing RouteConfig so a partial update (e.g. only
+		// --route-host) preserves previously-set fields, mirroring how the
+		// ingress path threads the existing IngressConfig through GetIngressConfig.
+		rc := &fv1.RouteConfig{}
+		if ht.Spec.RouteConfig != nil {
+			rc = ht.Spec.RouteConfig.DeepCopy()
+		}
+		if input.IsSet(flagkey.HtRouteProvider) {
+			rc.Provider = fv1.RouteProviderType(input.String(flagkey.HtRouteProvider))
+		}
+		if input.IsSet(flagkey.HtRouteHost) {
+			rc.Hostnames = input.StringSlice(flagkey.HtRouteHost)
+		}
+		if input.IsSet(flagkey.HtRoutePath) {
+			rc.Path = input.String(flagkey.HtRoutePath)
+		}
+		if input.IsSet(flagkey.HtRouteTLS) {
+			rc.TLS = input.String(flagkey.HtRouteTLS)
+		}
+		if input.IsSet(flagkey.HtRouteAnnotation) {
+			// "-" clears all annotations, matching the ingress flag semantics.
+			remove, anns, err := getIngressAnnotations(input.StringSlice(flagkey.HtRouteAnnotation))
+			if err != nil {
+				return fmt.Errorf("illegal route annotation: %w", err)
+			}
+			if remove {
+				rc.Annotations = nil
+			} else {
+				rc.Annotations = anns
+			}
+		}
+		if input.IsSet(flagkey.HtGateway) {
+			parentRefs, err := parseGatewayParentRefs(input.StringSlice(flagkey.HtGateway))
+			if err != nil {
+				return err
+			}
+			rc.Gateway = &fv1.GatewayRouteConfig{ParentRefs: parentRefs}
+		}
+		if rc.Provider == "" {
+			return fmt.Errorf("--%s is required to configure a route (one of %q, %q)",
+				flagkey.HtRouteProvider, fv1.RouteProviderIngress, fv1.RouteProviderGateway)
+		}
+		if rc.Path == "" {
+			if ht.Spec.Prefix != nil && *ht.Spec.Prefix != "" {
+				rc.Path = *ht.Spec.Prefix
+			} else {
+				rc.Path = ht.Spec.RelativeURL
+			}
+		}
+		ht.Spec.RouteConfig = rc
 	}
 
 	opts.trigger = ht

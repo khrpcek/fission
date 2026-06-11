@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package fetcher
 
 import (
@@ -14,6 +18,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/fission/fission/cmd/fetcher/app"
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
@@ -32,7 +37,6 @@ import (
 	"github.com/fission/fission/pkg/utils"
 	"github.com/fission/fission/pkg/utils/httpserver"
 	"github.com/fission/fission/pkg/utils/loggerfactory"
-	"github.com/fission/fission/pkg/utils/manager"
 	"github.com/fission/fission/pkg/utils/profile"
 	"github.com/fission/fission/test/e2e/framework"
 	"github.com/fission/fission/test/e2e/framework/cli"
@@ -50,7 +54,7 @@ module.exports = async function (context) {
 
 type FetcherTestSuite struct {
 	suite.Suite
-	mgr           manager.Interface
+	mgr           *errgroup.Group
 	logger        logr.Logger
 	cancel        context.CancelFunc
 	framework     *framework.Framework
@@ -80,7 +84,7 @@ func (f *FetcherTestSuite) SetupSuite() {
 
 	f.logger = loggerfactory.GetLogger()
 	f.framework = framework.NewFramework()
-	f.mgr = manager.New()
+	f.mgr = &errgroup.Group{}
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancel = cancel
 	f.ctx = ctx
@@ -106,8 +110,9 @@ func (f *FetcherTestSuite) SetupSuite() {
 	})
 	mux.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir("."))))
 
-	f.mgr.Add(ctx, func(c context.Context) {
+	f.mgr.Go(func() error {
 		httpserver.StartServer(ctx, f.logger, f.mgr, "specialize", "8888", mux)
+		return nil
 	})
 
 	err = f.framework.Start(ctx)
@@ -147,11 +152,12 @@ func (f *FetcherTestSuite) SetupSuite() {
 	fetcherUrl := "http://localhost:" + fetcherPort + "/"
 
 	profile.ProfileIfEnabled(ctx, f.logger, f.mgr)
-	f.mgr.Add(ctx, func(c context.Context) {
+	f.mgr.Go(func() error {
 		err := app.Run(ctx, f.framework.ClientGen(), f.logger, f.mgr, fetcherPort, f.podInfoDir)
 		if err != nil {
 			f.logger.Error(err, "fetcher failed")
 		}
+		return nil
 	})
 
 	// In-process e2e: server and client are in the same process, so the
@@ -207,7 +213,10 @@ func (f *FetcherTestSuite) TestFetcherDeploymentType() {
 		}
 
 		for _, pkg := range pkgs.Items {
-			if pkg.Name == testDeployPkg && pkg.Status.BuildStatus == fv1.BuildStatusSucceeded {
+			// A deploy-archive package needs no build: the buildermgr marks it
+			// "none" (no build required), which is an equally-ready state as
+			// "succeeded" (see fetcher build-status gate). Accept either.
+			if pkg.Name == testDeployPkg && (pkg.Status.BuildStatus == fv1.BuildStatusSucceeded || pkg.Status.BuildStatus == fv1.BuildStatusNone) {
 				return true, nil
 			} else if pkg.Name == testDeployPkg && pkg.Status.BuildStatus == fv1.BuildStatusFailed {
 				return true, fmt.Errorf("build failed for package:%s", pkg.Name)
@@ -258,7 +267,10 @@ func (f *FetcherTestSuite) TestFetcherURLType() {
 		}
 
 		for _, pkg := range pkgs.Items {
-			if pkg.Name == testDeployPkg && pkg.Status.BuildStatus == fv1.BuildStatusSucceeded {
+			// A deploy-archive package needs no build: the buildermgr marks it
+			// "none" (no build required), which is an equally-ready state as
+			// "succeeded" (see fetcher build-status gate). Accept either.
+			if pkg.Name == testDeployPkg && (pkg.Status.BuildStatus == fv1.BuildStatusSucceeded || pkg.Status.BuildStatus == fv1.BuildStatusNone) {
 				return true, nil
 			} else if pkg.Name == testDeployPkg && pkg.Status.BuildStatus == fv1.BuildStatusFailed {
 				return true, fmt.Errorf("build failed for package:%s", pkg.Name)
@@ -379,7 +391,10 @@ func (f *FetcherTestSuite) TestFetcherSpecialize() {
 		}
 
 		for _, pkg := range pkgs.Items {
-			if pkg.Name == testDeployPkg && pkg.Status.BuildStatus == fv1.BuildStatusSucceeded {
+			// A deploy-archive package needs no build: the buildermgr marks it
+			// "none" (no build required), which is an equally-ready state as
+			// "succeeded" (see fetcher build-status gate). Accept either.
+			if pkg.Name == testDeployPkg && (pkg.Status.BuildStatus == fv1.BuildStatusSucceeded || pkg.Status.BuildStatus == fv1.BuildStatusNone) {
 				return true, nil
 			} else if pkg.Name == testDeployPkg && pkg.Status.BuildStatus == fv1.BuildStatusFailed {
 				return true, fmt.Errorf("build failed for package:%s", pkg.Name)
@@ -507,7 +522,7 @@ func (f *FetcherTestSuite) TearDownSuite() {
 
 	f.cancel()
 
-	f.mgr.Wait()
+	_ = f.mgr.Wait()
 	err = f.framework.Stop()
 	require.NoError(f.T(), err, "error stopping framework")
 

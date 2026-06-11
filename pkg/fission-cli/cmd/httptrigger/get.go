@@ -1,26 +1,12 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package httptrigger
 
 import (
 	"fmt"
-	"os"
 	"strings"
-	"text/tabwriter"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -28,6 +14,7 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/cliwrapper/cli"
 	"github.com/fission/fission/pkg/fission-cli/cmd"
 	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
+	"github.com/fission/fission/pkg/fission-cli/util"
 )
 
 type GetSubCommand struct {
@@ -43,9 +30,9 @@ func (opts *GetSubCommand) do(input cli.Input) error {
 }
 
 func (opts *GetSubCommand) run(input cli.Input) (err error) {
-	_, namespace, err := opts.GetResourceNamespace(input, flagkey.NamespaceFunction)
+	_, namespace, err := opts.GetResourceNamespace(input, flagkey.NamespaceTrigger)
 	if err != nil {
-		return fmt.Errorf("error in deleting function : %w", err)
+		return fmt.Errorf("error in getting HTTP trigger: %w", err)
 	}
 
 	ht, err := opts.Client().FissionClientSet.CoreV1().HTTPTriggers(namespace).Get(input.Context(), input.String(flagkey.HtName), metav1.GetOptions{})
@@ -53,15 +40,27 @@ func (opts *GetSubCommand) run(input cli.Input) (err error) {
 		return fmt.Errorf("error getting http trigger: %w", err)
 	}
 
-	printHtSummary([]fv1.HTTPTrigger{*ht})
+	format, err := util.ParseOutputFormat(input.String(flagkey.Output))
+	if err != nil {
+		return err
+	}
+	if handled, err := util.PrintStructured(format, ht); err != nil || handled {
+		return err
+	}
+
+	// describe renders the plain table (no -o wide AGE column), consistent with
+	// the other describe commands; json/yaml are handled above.
+	if err := printHtSummary(util.OutputTable, []fv1.HTTPTrigger{*ht}); err != nil {
+		return err
+	}
+	util.PrintConditions(ht.Status.Conditions)
 
 	return nil
 }
 
-func printHtSummary(triggers []fv1.HTTPTrigger) {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', 0)
-	fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", "NAME", "METHOD", "URL", "FUNCTION(s)", "INGRESS", "HOST", "PATH", "TLS", "ANNOTATIONS", "NAMESPACE")
-	for _, trigger := range triggers {
+func printHtSummary(format util.OutputFormat, triggers []fv1.HTTPTrigger) error {
+	headers := []string{"NAME", "METHOD", "URL", "FUNCTION(s)", "INGRESS", "HOST", "PATH", "TLS", "ANNOTATIONS", "READY", "NAMESPACE"}
+	row := func(trigger fv1.HTTPTrigger) []string {
 		function := ""
 		if trigger.Spec.FunctionReference.Type == fv1.FunctionReferenceTypeFunctionName {
 			function = trigger.Spec.FunctionReference.Name
@@ -93,8 +92,14 @@ func printHtSummary(triggers []fv1.HTTPTrigger) {
 		if len(trigger.Spec.Methods) > 0 {
 			methods = trigger.Spec.Methods
 		}
-		fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n",
-			trigger.Name, methods, trigger.Spec.RelativeURL, function, trigger.Spec.CreateIngress, host, path, trigger.Spec.IngressConfig.TLS, ann, trigger.Namespace)
+		return []string{
+			trigger.Name, fmt.Sprintf("%v", methods), trigger.Spec.RelativeURL, function,
+			fmt.Sprintf("%v", trigger.Spec.CreateIngress), host, path, fmt.Sprintf("%v", trigger.Spec.IngressConfig.TLS), ann,
+			util.ConditionStatus(trigger.Status.Conditions, fv1.HTTPTriggerConditionReady),
+			trigger.Namespace,
+		}
 	}
-	w.Flush()
+	wideExtra := []string{"AGE"}
+	wideRow := func(trigger fv1.HTTPTrigger) []string { return []string{util.AgeOf(trigger.CreationTimestamp)} }
+	return util.PrintObjects(format, triggers, headers, row, wideExtra, wideRow)
 }

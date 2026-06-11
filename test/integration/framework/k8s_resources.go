@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build integration
 
 package framework
@@ -26,6 +30,31 @@ func (ns *TestNamespace) CreateConfigMap(t *testing.T, ctx context.Context, name
 	require.NoErrorf(t, err, "create configmap %q", name)
 	ns.addCleanup("configmap "+name, func(c context.Context) error {
 		err := ns.f.kubeClient.CoreV1().ConfigMaps(ns.Name).Delete(c, name, metav1.DeleteOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	})
+}
+
+// CreateService creates a minimal ClusterIP Service in the test namespace and
+// registers its deletion on the cleanup chain. It needs no backing pods — it
+// exists purely to fire a create event for KubernetesWatchTrigger tests
+// (the kubewatcher supports watching Service objects).
+func (ns *TestNamespace) CreateService(t *testing.T, ctx context.Context, name string) {
+	t.Helper()
+	require.NotEmpty(t, name, "CreateService: name")
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"watched-by": name},
+			Ports:    []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	_, err := ns.f.kubeClient.CoreV1().Services(ns.Name).Create(ctx, svc, metav1.CreateOptions{})
+	require.NoErrorf(t, err, "create service %q", name)
+	ns.addCleanup("service "+name, func(c context.Context) error {
+		err := ns.f.kubeClient.CoreV1().Services(ns.Name).Delete(c, name, metav1.DeleteOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil
 		}

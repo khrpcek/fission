@@ -1,18 +1,7 @@
-/*
-Copyright 2019 The Fission Authors.
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package util
 
 import (
@@ -24,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/fission-cli/cmd"
@@ -235,16 +223,17 @@ func WriteArchiveToFile(fileName string, reader io.Reader) error {
 	return nil
 }
 
-// PrintPackageSummary prints package information and build logs.
+// PrintPackageSummary prints package information, conditions and build logs.
 func PrintPackageSummary(writer io.Writer, pkg *fv1.Package) {
 	// replace escaped line breaker character
 	buildlog := strings.ReplaceAll(pkg.Status.BuildLog, `\n`, "\n")
-	w := tabwriter.NewWriter(writer, 0, 0, 1, ' ', 0)
+	w := util.NewTabWriter(writer)
 	fmt.Fprintf(w, "%v\t%v\n", "Name:", pkg.Name)
 	fmt.Fprintf(w, "%v\t%v\n", "Environment:", pkg.Spec.Environment.Name)
 	fmt.Fprintf(w, "%v\t%v\n", "Status:", pkg.Status.BuildStatus)
-	fmt.Fprintf(w, "%v\n%v", "Build Logs:", buildlog)
 	w.Flush()
+	util.PrintConditionsTo(writer, pkg.Status.Conditions)
+	fmt.Fprintf(writer, "%v\n%v", "Build Logs:", buildlog)
 }
 
 // validArchiveURL checks if the given URL is a valid archive URL

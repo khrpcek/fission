@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package flag
 
@@ -90,6 +78,9 @@ var (
 	ForceNamespace       = Flag{Type: Bool, Name: flagkey.ForceNamespace, Aliases: []string{"force"}, Usage: "If true, resources will be created in namespace provided by (--namespace flag ) even if spec file contains some other namespace", DefaultValue: false}
 	ForceDelete          = Flag{Type: Bool, Name: flagkey.ForceDelete, Aliases: []string{"force"}, Usage: "Delete all resources across all namespaces present in spec"}
 	AllNamespaces        = Flag{Type: Bool, Name: flagkey.AllNamespaces, Short: "A", Usage: "Fetch resources from all namespaces"}
+	Output               = Flag{Type: String, Name: flagkey.Output, Short: "o", Usage: "Output format: wide, json or yaml (default: table)"}
+	WaitFor              = Flag{Type: String, Name: flagkey.WaitFor, Usage: "Condition to wait for, e.g. condition=Ready or condition=Ready=False"}
+	WaitTimeout          = Flag{Type: Duration, Name: flagkey.WaitTimeout, DefaultValue: util.DefaultWaitTimeout, Usage: "Maximum time to wait for the condition before giving up"}
 	RunTimeMinCPU        = Flag{Type: Int, Name: flagkey.RuntimeMincpu, Usage: "Minimum CPU to be assigned to pod (In millicore, minimum 1)"}
 	RunTimeMaxCPU        = Flag{Type: Int, Name: flagkey.RuntimeMaxcpu, Usage: "Maximum CPU to be assigned to pod (In millicore, minimum 1)"}
 	RunTimeTargetCPU     = Flag{Type: Int, Name: flagkey.RuntimeTargetcpu, Usage: "Target average CPU usage percentage across pods for scaling", DefaultValue: 80}
@@ -126,6 +117,14 @@ var (
 	FnTestHeader            = Flag{Type: StringSlice, Name: flagkey.FnTestHeader, Short: "H", Usage: "Request headers"}
 	FnTestQuery             = Flag{Type: StringSlice, Name: flagkey.FnTestQuery, Short: "q", Usage: "Request query parameters: -q key1=value1 -q key2=value2"}
 	FnIdleTimeout           = Flag{Type: Int, Name: flagkey.FnIdleTimeout, Usage: "The length of time (in seconds) that a function is idle before pod(s) are eligible for recycling", DefaultValue: 120}
+	FnStreaming             = Flag{Type: Bool, Name: flagkey.FnStreaming, Usage: "Enable streaming (SSE/chunked/WebSocket) responses for this function; the response is flushed incrementally and not cut by the function timeout"}
+	FnStreamingProtocol     = Flag{Type: String, Name: flagkey.FnStreamingProtocol, Usage: "Streaming protocol when --streaming is set; one of 'auto', 'sse', 'chunked', 'websocket'", DefaultValue: "auto"}
+	FnStreamingIdleTimeout  = Flag{Type: Int, Name: flagkey.FnStreamingIdleTimeout, Usage: "Idle timeout (seconds) for a streaming response before it is aborted; reset on each chunk", DefaultValue: 60}
+	FnStreamingMaxDuration  = Flag{Type: Int, Name: flagkey.FnStreamingMaxDuration, Usage: "Hard ceiling (seconds) on total streaming response lifetime; 0 means no ceiling (the idle timeout governs)", DefaultValue: 0}
+	FnExposeAsMCP           = Flag{Type: Bool, Name: flagkey.FnExposeAsMCP, Usage: "Advertise this function as a Model Context Protocol (MCP) tool on the MCP server"}
+	FnToolDescription       = Flag{Type: String, Name: flagkey.FnToolDescription, Usage: "Agent-facing tool description (required with --expose-as-mcp)"}
+	FnToolInputSchema       = Flag{Type: String, Name: flagkey.FnToolInputSchema, Usage: "Path to a JSON Schema file describing the tool's arguments; advertised verbatim as the MCP tool inputSchema"}
+	FnToolName              = Flag{Type: String, Name: flagkey.FnToolName, Usage: "Override the advertised MCP tool name (defaults to <namespace>-<function name>)"}
 	FnConcurrency           = Flag{Type: Int, Name: flagkey.FnConcurrency, Aliases: []string{"con"}, Usage: "Maximum number of pods specialized concurrently to serve requests (Only valid for executortype; `poolmgr`)", DefaultValue: 500}
 	FnRequestsPerPod        = Flag{Type: Int, Name: flagkey.FnRequestsPerPod, Aliases: []string{"rpp"}, Usage: "Maximum number of concurrent requests that can be served by a specialized pod (Only valid for executortype; `poolmgr`)", DefaultValue: 1}
 	FnOnceOnly              = Flag{Type: Bool, Name: flagkey.FnOnceOnly, Aliases: []string{"yolo"}, Usage: "Specifies if specialized pod will serve exactly one request in its lifetime (Only valid for executortype; `poolmgr`)"}
@@ -139,11 +138,17 @@ var (
 	HtMethod            = Flag{Type: StringSlice, Name: flagkey.HtMethod, Usage: "HTTP Methods: GET,POST,PUT,DELETE,HEAD. To mention single method: --method GET and for multiple methods --method GET --method POST. [DEPRECATED for 'fn create', use 'route create' instead]", DefaultValue: []string{http.MethodGet}}
 	HtUrl               = Flag{Type: String, Name: flagkey.HtUrl, Usage: "URL pattern (See gorilla/mux supported patterns) [DEPRECATED for 'fn create', use 'route create' instead]"}
 	HtHost              = Flag{Type: String, Name: flagkey.HtHost, Usage: "Use --ingressrule instead", Deprecated: true, Substitute: flagkey.HtIngressRule}
-	HtIngress           = Flag{Type: Bool, Name: flagkey.HtIngress, Usage: "Creates ingress with same URL"}
-	HtIngressRule       = Flag{Type: String, Name: flagkey.HtIngressRule, Usage: "Host for Ingress rule: --ingressrule host=path (the format of host/path depends on what ingress controller you used)"}
-	HtIngressAnnotation = Flag{Type: StringSlice, Name: flagkey.HtIngressAnnotation, Usage: "Annotation for Ingress: --ingressannotation key=value (the format of annotation depends on what ingress controller you used)"}
+	HtIngress           = Flag{Type: Bool, Name: flagkey.HtIngress, Usage: "Creates ingress with same URL [DEPRECATED: the Kubernetes Ingress API is frozen, use --route-provider gateway instead]"}
+	HtIngressRule       = Flag{Type: String, Name: flagkey.HtIngressRule, Usage: "Host for Ingress rule: --ingressrule host=path (the format of host/path depends on what ingress controller you used) [DEPRECATED: use --route-host/--route-path]"}
+	HtIngressAnnotation = Flag{Type: StringSlice, Name: flagkey.HtIngressAnnotation, Usage: "Annotation for Ingress: --ingressannotation key=value (the format of annotation depends on what ingress controller you used) [DEPRECATED: use --route-annotation]"}
 	HtIngressClassName  = Flag{Type: String, Name: flagkey.HtIngressClassName, Usage: "Class name for Ingress: --ingressclass name (the format of class name depends on what ingress controller you used)"}
-	HtIngressTLS        = Flag{Type: String, Name: flagkey.HtIngressTLS, Usage: "Name of the Secret contains TLS key and crt for Ingress (the usability of TLS features depends on what ingress controller you used)"}
+	HtIngressTLS        = Flag{Type: String, Name: flagkey.HtIngressTLS, Usage: "Name of the Secret contains TLS key and crt for Ingress (the usability of TLS features depends on what ingress controller you used) [DEPRECATED: use --route-tls]"}
+	HtRouteProvider     = Flag{Type: String, Name: flagkey.HtRouteProvider, Usage: "Route provider that exposes the function externally: one of 'ingress' or 'gateway' (Gateway API HTTPRoute). When set, takes precedence over --createingress."}
+	HtRouteHost         = Flag{Type: StringSlice, Name: flagkey.HtRouteHost, Usage: "Hostname the route matches (repeatable): --route-host demo.example.com. Empty matches all hosts."}
+	HtRoutePath         = Flag{Type: String, Name: flagkey.HtRoutePath, Usage: "Request path the route matches (must start with '/'); defaults to the trigger URL/prefix"}
+	HtRouteAnnotation   = Flag{Type: StringSlice, Name: flagkey.HtRouteAnnotation, Usage: "Annotation added to the generated route object: --route-annotation key=value (repeatable)"}
+	HtRouteTLS          = Flag{Type: String, Name: flagkey.HtRouteTLS, Usage: "Name of the Secret holding TLS key and cert (ingress provider only; gateway TLS is configured on the Gateway listener)"}
+	HtGateway           = Flag{Type: StringSlice, Name: flagkey.HtGateway, Usage: "Parent Gateway the HTTPRoute attaches to (gateway provider): --gateway name or --gateway namespace/name (repeatable)"}
 	HtFnName            = Flag{Type: StringSlice, Name: flagkey.HtFnName, Usage: "Name(s) of the function for this trigger. (If 2 functions are supplied with this flag, traffic gets routed to them based on weights supplied with --weight flag.)"}
 	HtFnWeight          = Flag{Type: IntSlice, Name: flagkey.HtFnWeight, Usage: "Weight for each function supplied with --function flag, in the same order. Used for canary deployment"}
 	HtFnFilter          = Flag{Type: String, Name: flagkey.HtFilter, Usage: "Name of the function for trigger(s)"}
@@ -210,6 +215,7 @@ var (
 	PkgSrcArchive     = Flag{Type: StringSlice, Name: flagkey.PkgSrcArchive, Aliases: []string{"source", "src"}, Usage: "URL or local paths for source archive"}
 	PkgSrcChecksum    = Flag{Type: String, Name: flagkey.PkgSrcChecksum, Usage: "SHA256 checksum of source archive when providing URL"}
 	PkgInsecure       = Flag{Type: Bool, Name: flagkey.PkgInsecure, Usage: "Skip generating SHA256 checksum for file integrity validation"}
+	PkgOCI            = Flag{Type: String, Name: flagkey.PkgOCI, Usage: "Pre-built OCI image reference containing the deployment code (registry/repo:tag[@digest])"}
 
 	SpecSave             = Flag{Type: Bool, Name: flagkey.SpecSave, Usage: "Save to the spec directory instead of creating on cluster"}
 	SpecDir              = Flag{Type: String, Name: flagkey.SpecDir, Usage: "Directory to store specs, defaults to ./specs"}
@@ -219,6 +225,7 @@ var (
 	SpecWatch            = Flag{Type: Bool, Name: flagkey.SpecWatch, Usage: "Watch local files for change, and re-apply specs as necessary"}
 	SpecDelete           = Flag{Type: Bool, Name: flagkey.SpecDelete, Usage: "Allow apply to delete resources that no longer exist in the specification"}
 	SpecDry              = Flag{Type: Bool, Name: flagkey.SpecDry, Usage: "View the generated specs"}
+	SpecApplyDryRun      = Flag{Type: Bool, Name: flagkey.SpecApplyDryRun, Usage: "Preview what apply would create/update/delete without changing the cluster"}
 	SpecValidation       = Flag{Type: String, Name: flagkey.SpecValidate, Usage: "Turns server side validations of Fission objects on/off"}
 	SpecIgnore           = Flag{Type: String, Name: flagkey.SpecIgnore, Usage: fmt.Sprintf("File containing specs to be ignored inside --specdir, defaults to %v", util.SPEC_IGNORE_FILE)}
 	SpecApplyCommitLabel = Flag{Type: Bool, Name: flagkey.SpecApplyCommitLabel, Usage: "Apply commit label to the resources"}

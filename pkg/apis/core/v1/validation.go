@@ -1,27 +1,17 @@
-/*
-Copyright 2018 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package v1
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -207,15 +197,70 @@ func (checksum Checksum) Validate() error {
 	return errs
 }
 
+// ociDigestRegexp matches the only digest form OCIArchive.Digest accepts;
+// it mirrors the field's kubebuilder Pattern marker in types.go.
+var ociDigestRegexp = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+
+func (o OCIArchive) Validate() error {
+	var errs error
+
+	if len(o.Image) == 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "OCIArchive.Image", o.Image, "image reference is required"))
+	}
+
+	if len(o.Digest) > 0 && !ociDigestRegexp.MatchString(o.Digest) {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "OCIArchive.Digest", o.Digest, "must be 'sha256:' followed by 64 hex characters"))
+	}
+
+	// A digest embedded in the image reference and a Digest field would race
+	// for precedence (the pull paths would resolve them differently) — make
+	// the user pick one.
+	if len(o.Digest) > 0 && strings.Contains(o.Image, "@") {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "OCIArchive.Digest", o.Digest, "image reference already pins a digest; set the digest in one place only"))
+	}
+
+	// SubPath rides into pod volumeMount subPaths on the image-volume path,
+	// where Kubernetes rejects absolute paths and path traversal.
+	if cleaned := strings.Trim(o.SubPath, "/"); cleaned != "" {
+		if strings.HasPrefix(o.SubPath, "/") || cleaned != filepath.Clean(cleaned) || strings.Contains(cleaned, "..") {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "OCIArchive.SubPath", o.SubPath, "must be a clean relative directory path inside the image (no leading '/', no '..')"))
+		}
+	}
+
+	return errs
+}
+
 func (archive Archive) Validate() error {
 	var errs error
 
 	if len(archive.Type) > 0 {
 		switch archive.Type {
-		case ArchiveTypeLiteral, ArchiveTypeUrl: // no op
+		case ArchiveTypeLiteral, ArchiveTypeUrl, ArchiveTypeOCI: // no op
 		default:
 			errs = errors.Join(errs, MakeValidationErr(ErrorUnsupportedType, "Archive.Type", archive.Type, "not a valid archive type"))
 		}
+	}
+
+	// At most one content source. The Archive CEL rule only covers url+oci
+	// (it cannot reference the byte-format literal field — see the marker
+	// comment in types.go); combinations involving literal are rejected here,
+	// via the validating webhook.
+	set := 0
+	if len(archive.Literal) > 0 {
+		set++
+	}
+	if len(archive.URL) > 0 {
+		set++
+	}
+	if archive.OCI != nil {
+		set++
+	}
+	if set > 1 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Archive", archive.Type, "at most one of literal, url, or oci may be set"))
+	}
+
+	if archive.OCI != nil {
+		errs = errors.Join(errs, archive.OCI.Validate())
 	}
 
 	if archive.Checksum != (Checksum{}) {
@@ -243,9 +288,15 @@ func (spec PackageSpec) Validate() error {
 	errs = errors.Join(errs, spec.Environment.Validate())
 
 	for _, r := range []Archive{spec.Source, spec.Deployment} {
-		if len(r.URL) > 0 || len(r.Literal) > 0 {
+		if !r.IsEmpty() {
 			errs = errors.Join(errs, r.Validate())
 		}
+	}
+
+	// OCI delivery applies to deployment archives only: source archives feed
+	// the builder, which has no OCI pull path.
+	if spec.Source.OCI != nil {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "PackageSpec.Source", spec.Source.Type, "oci archives are supported on the deployment archive only"))
 	}
 
 	return errs
@@ -255,7 +306,12 @@ func (sts PackageStatus) Validate() error {
 	var errs error
 
 	switch sts.BuildStatus {
-	case BuildStatusPending, BuildStatusRunning, BuildStatusSucceeded, BuildStatusFailed, BuildStatusNone: // no op
+	// "" (empty) is the not-yet-processed state: with the Package /status
+	// subresource, the apiserver strips the status set by the defaulting webhook
+	// on create, so a package is admitted with an empty BuildStatus and the
+	// buildermgr fills it in (setInitialBuildStatus). Reject only genuinely
+	// unknown values.
+	case "", BuildStatusPending, BuildStatusRunning, BuildStatusSucceeded, BuildStatusFailed, BuildStatusNone: // no op
 	default:
 		errs = errors.Join(errs, MakeValidationErr(ErrorUnsupportedType, "PackageStatus.BuildStatus", sts.BuildStatus, "not a valid build status"))
 	}
@@ -297,10 +353,79 @@ func (spec FunctionSpec) Validate() error {
 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.PodSpec", "", "executor type container requires a pod spec"))
 	}
 
+	if spec.Streaming != nil {
+		errs = errors.Join(errs, spec.Streaming.Validate())
+	}
+
+	if spec.Tool != nil {
+		errs = errors.Join(errs, spec.Tool.Validate())
+	}
+
+	// Non-CEL admission check (pod-spec security). Kept in Validate() so the
+	// CLI checks it client-side; the webhook runs it via ValidateForAdmission().
+	errs = errors.Join(errs, spec.validateForAdmission())
+
 	// TODO Add below validation warning
 	// if spec.FunctionTimeout <= 0 {
 	// 	errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionTimeout value", spec.FunctionTimeout, "not a valid value. Should always be more than 0"))
 	// }
+
+	return errs
+}
+
+// validateForAdmission returns the FunctionSpec checks the API server cannot
+// enforce via CEL and the admission webhook must still run: pod-spec security
+// (iterating an embedded PodSpec exceeds the CEL cost budget; GHSA-v455-mv2v-5g92).
+func (spec FunctionSpec) validateForAdmission() error {
+	return ValidatePodSpecSafety("Function.spec.podspec", spec.PodSpec)
+}
+
+// Validate checks the streaming config: a known protocol, non-negative timeouts,
+// and a max duration that is not below the idle timeout when both are set.
+func (sc *StreamingConfig) Validate() error {
+	var errs error
+
+	switch sc.Protocol {
+	case "", StreamingAuto, StreamingSSE, StreamingChunked, StreamingWebSocket:
+		// ok
+	default:
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Streaming.Protocol", sc.Protocol, "not a valid streaming protocol"))
+	}
+
+	if sc.IdleTimeoutSeconds < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Streaming.IdleTimeoutSeconds", sc.IdleTimeoutSeconds, "must be >= 0"))
+	}
+	if sc.MaxDurationSeconds < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Streaming.MaxDurationSeconds", sc.MaxDurationSeconds, "must be >= 0"))
+	}
+	if sc.IdleTimeoutSeconds > 0 && sc.MaxDurationSeconds > 0 && sc.MaxDurationSeconds < sc.IdleTimeoutSeconds {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Streaming.MaxDurationSeconds", sc.MaxDurationSeconds, "must be >= IdleTimeoutSeconds"))
+	}
+
+	return errs
+}
+
+// Validate checks the MCP tool config (only reached when FunctionSpec.Tool is
+// non-nil, i.e. the function is advertised): a description is required, and a
+// supplied InputSchema must parse as a JSON object carrying a "type" key (a
+// cheap structural check — full JSON-Schema meta-validation is the agent's job,
+// and CEL cannot parse arbitrary schemas). The ToolName pattern is enforced by
+// the CRD kubebuilder marker.
+func (tc *ToolConfig) Validate() error {
+	var errs error
+
+	if strings.TrimSpace(tc.Description) == "" {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Tool.Description", tc.Description, "a description is required when the function is exposed as an MCP tool"))
+	}
+
+	if tc.InputSchema != nil && len(tc.InputSchema.Raw) > 0 {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(tc.InputSchema.Raw, &obj); err != nil {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Tool.InputSchema", string(tc.InputSchema.Raw), "must be a JSON object"))
+		} else if _, ok := obj["type"]; !ok {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Tool.InputSchema", string(tc.InputSchema.Raw), `must be a JSON Schema object with a "type" key`))
+		}
+	}
 
 	return errs
 }
@@ -453,10 +578,77 @@ func (spec HTTPTriggerSpec) Validate() error {
 	}
 
 	errs = errors.Join(errs, spec.IngressConfig.Validate())
+	if spec.RouteConfig != nil {
+		errs = errors.Join(errs, spec.RouteConfig.Validate())
+	}
 	if spec.CorsConfig != nil {
 		errs = errors.Join(errs, spec.CorsConfig.Validate())
 	}
+
+	// Path validation. HTTPTrigger has no admission webhook on current main
+	// (the API server's CEL evaluation is the admission gate); these checks
+	// mirror the CEL rules on HTTPTriggerSpec so the CLI and the router
+	// reconciler's status-Condition path agree with what the API server
+	// admits. Closes GHSA-vchh-r53j-8mpw.
+	prefix := ""
+	if spec.Prefix != nil {
+		prefix = *spec.Prefix
+	}
+	if spec.RelativeURL == "" && prefix == "" {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec", "",
+			"at least one of relativeurl or prefix must be set"))
+	}
+	if spec.RelativeURL != "" {
+		errs = errors.Join(errs, validateTriggerPath("HTTPTriggerSpec.RelativeURL", spec.RelativeURL))
+	}
+	if prefix != "" {
+		errs = errors.Join(errs, validateTriggerPath("HTTPTriggerSpec.Prefix", prefix))
+	}
 	return errs
+}
+
+// routerReservedExactPaths are URL paths the router serves itself: liveness
+// (/router-healthz), readiness (/readyz), version (/_version), and the
+// chart-default auth login (/auth/login). Installations that change the auth
+// path must still ensure their custom path does not collide with another
+// HTTPTrigger; this list covers the defaults the router ships with.
+var routerReservedExactPaths = map[string]struct{}{
+	"/router-healthz": {},
+	"/readyz":         {},
+	"/_version":       {},
+	"/auth/login":     {},
+}
+
+// routerInternalFunctionPrefix is the URL prefix the router serves on its
+// internal listener (post-GHSA-3g33-6vg6-27m8) for direct function invocation.
+// Triggers under this prefix would shadow internal routes if the public/
+// internal listener split is misconfigured.
+const routerInternalFunctionPrefix = "/fission-function/"
+
+// validateTriggerPath enforces the URL-path safety invariants for RelativeURL
+// and Prefix in HTTPTriggerSpec. Keep these checks aligned with the CEL rules
+// on HTTPTriggerSpec in types.go.
+func validateTriggerPath(field, path string) error {
+	if !strings.HasPrefix(path, "/") {
+		return MakeValidationErr(ErrorInvalidValue, field, path, "must start with '/'")
+	}
+	if path == "/" {
+		return MakeValidationErr(ErrorInvalidValue, field, path, "root-only path '/' is not allowed")
+	}
+	// Reject any ".." path segment. Splitting on '/' (rather than substring
+	// match) permits literal names like "..foo" or "foo..bar" while catching
+	// the traversal form ".." that the router would otherwise resolve away.
+	if slices.Contains(strings.Split(path, "/"), "..") {
+		return MakeValidationErr(ErrorInvalidValue, field, path, "must not contain '..' path segments")
+	}
+	if _, reserved := routerReservedExactPaths[path]; reserved {
+		return MakeValidationErr(ErrorInvalidValue, field, path, "collides with a router-owned path")
+	}
+	if strings.HasPrefix(path, routerInternalFunctionPrefix) {
+		return MakeValidationErr(ErrorInvalidValue, field, path,
+			"collides with the router-internal "+routerInternalFunctionPrefix+" prefix")
+	}
+	return nil
 }
 
 // Validate enforces the CORS spec invariants that browsers will reject
@@ -560,6 +752,66 @@ func (config IngressConfig) Validate() error {
 	return errs
 }
 
+// Validate checks a RouteConfig. It mirrors the CEL rules on the RouteConfig
+// type so the CLI and the admission gate agree on what is rejected. Cluster-side
+// concerns the API server cannot know — whether the gateway provider is enabled,
+// whether a default Gateway is configured — are not checked here; the router
+// reconciler logs and retries those, so a misconfiguration surfaces in the
+// router logs rather than as a CRD validation error.
+func (config RouteConfig) Validate() error {
+	var errs error
+
+	switch config.Provider {
+	case RouteProviderIngress, RouteProviderGateway:
+	default:
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Provider", string(config.Provider), "must be one of: ingress, gateway"))
+	}
+
+	// Path is matched literally by both providers (the gateway provider emits a
+	// PathPrefix match with this value), so it is validated as an absolute path,
+	// not a regex.
+	if len(config.Path) > 0 && !strings.HasPrefix(config.Path, "/") {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Path", config.Path, "must be an absolute path"))
+	}
+
+	for _, host := range config.Hostnames {
+		if len(host) == 0 || host == "*" {
+			continue
+		}
+		if strings.Contains(host, "*") {
+			for _, msg := range validation.IsWildcardDNS1123Subdomain(host) {
+				errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Hostnames", host, msg))
+			}
+			continue
+		}
+		for _, msg := range validation.IsDNS1123Subdomain(host) {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Hostnames", host, msg))
+		}
+	}
+
+	var totalSize int64
+	for k, v := range config.Annotations {
+		for _, msg := range validation.IsQualifiedName(strings.ToLower(k)) {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Annotations.key", k, msg))
+		}
+		totalSize += (int64)(len(k)) + (int64)(len(v))
+	}
+	if totalSize > (int64)(totalAnnotationSizeLimitB) {
+		msg := fmt.Sprintf("must have at most %v characters", totalSize)
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Annotations.value", totalAnnotationSizeLimitB, msg))
+	}
+
+	if config.Gateway != nil {
+		for i, ref := range config.Gateway.ParentRefs {
+			if len(ref.Name) == 0 {
+				errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, fmt.Sprintf("HTTPTriggerSpec.RouteConfig.Gateway.ParentRefs[%d].Name", i), ref.Name, "must not be empty"))
+			}
+		}
+	}
+
+	return errs
+}
+
 func (spec KubernetesWatchTriggerSpec) Validate() error {
 	var errs error
 
@@ -571,16 +823,33 @@ func (spec KubernetesWatchTriggerSpec) Validate() error {
 
 	errs = errors.Join(errs,
 		ValidateKubeName("KubernetesWatchTriggerSpec.Namespace", spec.Namespace),
-		ValidateKubeLabel("KubernetesWatchTriggerSpec.LabelSelector", spec.LabelSelector),
-		spec.FunctionReference.Validate())
+		spec.FunctionReference.Validate(),
+		spec.validateForAdmission())
 
 	return errs
+}
+
+// validateForAdmission returns the KubernetesWatchTriggerSpec checks CEL cannot
+// express: label-selector qualified key/value validation. (Type, namespace, and
+// function-reference are enforced by CEL on the CRD.)
+func (spec KubernetesWatchTriggerSpec) validateForAdmission() error {
+	return ValidateKubeLabel("KubernetesWatchTriggerSpec.LabelSelector", spec.LabelSelector)
 }
 
 func (spec MessageQueueTriggerSpec) Validate() error {
 	var errs error
 
 	errs = errors.Join(errs, spec.FunctionReference.Validate())
+	errs = errors.Join(errs, spec.validateForAdmission())
+
+	return errs
+}
+
+// validateForAdmission returns the MessageQueueTriggerSpec checks CEL cannot
+// express: message-queue type and topic/response-topic validity, looked up in
+// the connector validator registry (pkg/mqtrigger/validator).
+func (spec MessageQueueTriggerSpec) validateForAdmission() error {
+	var errs error
 
 	if !validator.IsValidMessageQueue((string)(spec.MessageQueueType), spec.MqtKind) {
 		errs = errors.Join(errs, MakeValidationErr(ErrorUnsupportedType, "MessageQueueTriggerSpec.MessageQueueType", spec.MessageQueueType, "not a supported message queue type"))
@@ -625,6 +894,15 @@ func (p *Package) Validate() error {
 	return errs
 }
 
+// ValidateForAdmission runs the Package checks the API server cannot enforce
+// via CEL. There are none on the spec itself (archive/checksum/build-status are
+// CEL-covered, reference names are CEL-covered); the webhook additionally
+// enforces the archive literal-size limit and the cross-namespace environment
+// check inline. Defined for a uniform webhook switch.
+func (p *Package) ValidateForAdmission() error {
+	return nil
+}
+
 func (pl *PackageList) Validate() error {
 	var errs error
 	// not validate ListMeta
@@ -644,6 +922,13 @@ func (f *Function) Validate() error {
 	return errs
 }
 
+// ValidateForAdmission runs only the checks the API server cannot enforce via
+// CEL (pod-spec security). The admission webhook calls this instead of Validate()
+// so it does not redundantly re-check the CEL-covered field rules.
+func (f *Function) ValidateForAdmission() error {
+	return f.Spec.validateForAdmission()
+}
+
 func (fl *FunctionList) Validate() error {
 	var errs error
 	for _, f := range fl.Items {
@@ -657,7 +942,20 @@ func (e *Environment) Validate() error {
 
 	errs = errors.Join(errs,
 		validateMetadata("Environment", e.ObjectMeta),
-		e.Spec.Validate())
+		e.Spec.Validate(),
+		e.validateForAdmission())
+
+	return errs
+}
+
+// validateForAdmission returns the Environment checks the API server cannot
+// enforce via CEL and the admission webhook must still run: the runtime
+// image/name invariant (a cross-field check comparing a container's image to
+// spec.runtime.image and its name to the environment name) and pod-spec /
+// container security on the runtime + builder podspecs and bare containers
+// (GHSA-gx55-f84r-v3r7, GHSA-wmgg-3p4h-48x7, GHSA-m63v-2g9w-2w6v).
+func (e *Environment) validateForAdmission() error {
+	var errs error
 
 	if e.Spec.Runtime.PodSpec != nil {
 		for _, container := range e.Spec.Runtime.PodSpec.Containers {
@@ -666,7 +964,22 @@ func (e *Environment) Validate() error {
 			}
 		}
 	}
+	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.runtime.podspec", e.Spec.Runtime.PodSpec))
+	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.builder.podspec", e.Spec.Builder.PodSpec))
+	// The standalone Runtime.Container / Builder.Container fields are merged
+	// into the runtime / builder pod without going through any PodSpec, so
+	// ValidatePodSpecSafety above does not reach them; validate their
+	// SecurityContext directly.
+	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.runtime.container", e.Spec.Runtime.Container))
+	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.builder.container", e.Spec.Builder.Container))
 	return errs
+}
+
+// ValidateForAdmission runs only the checks the API server cannot enforce via
+// CEL (see validateForAdmission). The admission webhook calls this instead of
+// Validate() so it does not redundantly re-check the CEL-covered field rules.
+func (e *Environment) ValidateForAdmission() error {
+	return e.validateForAdmission()
 }
 
 func (el *EnvironmentList) Validate() error {
@@ -705,6 +1018,13 @@ func (k *KubernetesWatchTrigger) Validate() error {
 	return errs
 }
 
+// ValidateForAdmission runs only the checks the API server cannot enforce via
+// CEL (label-selector qualified key/value). The admission webhook calls this
+// instead of Validate(); its cross-namespace check stays inline in the webhook.
+func (k *KubernetesWatchTrigger) ValidateForAdmission() error {
+	return k.Spec.validateForAdmission()
+}
+
 func (kl *KubernetesWatchTriggerList) Validate() error {
 	var errs error
 	for _, k := range kl.Items {
@@ -739,6 +1059,13 @@ func (m *MessageQueueTrigger) Validate() error {
 		m.Spec.Validate())
 
 	return errs
+}
+
+// ValidateForAdmission runs only the checks the API server cannot enforce via
+// CEL (message-queue type/topic validity). The admission webhook calls this
+// instead of Validate(); its podspec allowlist stays inline in the webhook.
+func (m *MessageQueueTrigger) ValidateForAdmission() error {
+	return m.Spec.validateForAdmission()
 }
 
 func (ml *MessageQueueTriggerList) Validate() error {

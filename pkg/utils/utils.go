@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package utils
 
@@ -50,12 +38,6 @@ func UrlForFunction(name, namespace string) string {
 		prefix = fmt.Sprintf("/fission-function/%s", namespace)
 	}
 	return fmt.Sprintf("%s/%s", prefix, name)
-}
-
-// IsNetworkError returns true if an error is a network error, and false otherwise.
-func IsNetworkError(err error) bool {
-	_, ok := err.(net.Error)
-	return ok
 }
 
 // GetFunctionIstioServiceName return service name of function for istio feature
@@ -128,6 +110,24 @@ func GetFileChecksum(fileName string) (*fv1.Checksum, error) {
 	f, err := os.Open(fileName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %v: %v", fileName, err)
+	}
+	defer f.Close()
+
+	sum, err := GetChecksum(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate checksum for %v", fileName)
+	}
+
+	return sum, nil
+}
+
+// RootFileChecksum is GetFileChecksum with fileName opened through an os.Root
+// rooted at base, so a request-derived path cannot read a file outside base
+// (CWE-22). Use this on the server-side fetch path.
+func RootFileChecksum(base, fileName string) (*fv1.Checksum, error) {
+	f, err := RootOpen(base, fileName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %v: %w", fileName, err)
 	}
 	defer f.Close()
 
@@ -217,6 +217,47 @@ func DownloadUrl(ctx context.Context, httpClient *http.Client, targetURL string,
 	return nil
 }
 
+// DownloadUrlToRoot is DownloadUrl with the destination opened through an
+// os.Root rooted at base, so a request-derived localPath cannot write outside
+// base (CWE-22). Use this on the server-side fetch path. As in DownloadUrl, the
+// destination file is created only after a 2xx response, so a failed download
+// leaves no partial file behind.
+func DownloadUrlToRoot(ctx context.Context, httpClient *http.Client, targetURL string, base string, localPath string) error {
+	if targetURL == "" {
+		return errors.New("empty URL")
+	}
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %s: %w", targetURL, err)
+	}
+	resp, err := ctxhttp.Get(ctx, httpClient, parsed.String())
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if !isHttp2xxSuccessful(resp.StatusCode) {
+		return errors.New(resp.Status)
+	}
+
+	w, err := RootOpenFile(base, localPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	// Force 0o600 even on the overwrite path, for the same reason as DownloadUrl.
+	if err = w.Chmod(0o600); err != nil {
+		return err
+	}
+
+	if _, err = io.Copy(w, resp.Body); err != nil {
+		return err
+	}
+
+	return w.Sync()
+}
+
 func GetStringValueFromEnv(envVar string) (string, error) {
 	v := os.Getenv(envVar)
 	if v == "" {
@@ -298,24 +339,4 @@ func DeleteOldPackages(pkgPath, pkgType string) error {
 func IsOwnerReferencesEnabled() bool {
 	disableOwnerReference, _ := strconv.ParseBool(os.Getenv(ENV_DISABLE_OWNER_REFERENCES))
 	return !disableOwnerReference
-}
-
-// SanitizeFilePath checks if the path is valid to prevent directory traversal attacks.
-func SanitizeFilePath(path string, safedir string) (string, error) {
-	if len(path) == 0 {
-		return "", errors.New("invalid path")
-	}
-	if len(safedir) == 0 {
-		return "", errors.New("invalid safe directory")
-	}
-	// get normalized path and check for directory traversal attacks
-	normalizedPath := filepath.Clean(path)
-	if normalizedPath != path {
-		return "", errors.New("invalid path")
-	}
-	// check if the path is under the safe directory
-	if !strings.HasPrefix(normalizedPath, safedir) {
-		return "", fmt.Errorf("path %s is not under the safe directory %s", normalizedPath, safedir)
-	}
-	return normalizedPath, nil
 }

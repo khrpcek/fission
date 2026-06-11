@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package spec
 
@@ -24,49 +12,39 @@ import (
 )
 
 func Commands() *cobra.Command {
-	initCmd := &cobra.Command{
+	initCmd := wrapper.SubCommand(&cobra.Command{
 		Use:   "init",
 		Short: "Create an initial declarative application specification",
-		RunE:  wrapper.Wrapper(Init),
-	}
-	wrapper.SetFlags(initCmd, flag.FlagSet{
+	}, Init, flag.FlagSet{
 		Optional: []flag.Flag{flag.SpecName, flag.SpecDeployID, flag.SpecDir},
 	})
 
-	validateCmd := &cobra.Command{
+	validateCmd := wrapper.SubCommand(&cobra.Command{
 		Use:   "validate",
 		Short: "Validate declarative application specification",
-		RunE:  wrapper.Wrapper(Validate),
-	}
-	wrapper.SetFlags(validateCmd, flag.FlagSet{
+	}, Validate, flag.FlagSet{
 		Optional: []flag.Flag{flag.SpecDir, flag.SpecIgnore, flag.SpecAllowConflicts},
 	})
 
-	applyCmd := &cobra.Command{
+	applyCmd := wrapper.SubCommand(&cobra.Command{
 		Use:   "apply",
 		Short: "Create, update, or delete resources from application specification",
-		RunE:  wrapper.Wrapper(Apply),
-	}
-	wrapper.SetFlags(applyCmd, flag.FlagSet{
+	}, Apply, flag.FlagSet{
 		Optional: []flag.Flag{flag.SpecDir, flag.SpecIgnore, flag.SpecDelete, flag.SpecWait, flag.SpecWatch,
-			flag.SpecValidation, flag.SpecApplyCommitLabel, flag.SpecAllowConflicts, flag.ForceNamespace},
+			flag.SpecValidation, flag.SpecApplyCommitLabel, flag.SpecAllowConflicts, flag.ForceNamespace, flag.SpecApplyDryRun},
 	})
 
-	destroyCmd := &cobra.Command{
+	destroyCmd := wrapper.SubCommand(&cobra.Command{
 		Use:   "destroy",
 		Short: "Delete all Fission resources in the application specification",
-		RunE:  wrapper.Wrapper(Destroy),
-	}
-	wrapper.SetFlags(destroyCmd, flag.FlagSet{
+	}, Destroy, flag.FlagSet{
 		Optional: []flag.Flag{flag.SpecDir, flag.SpecIgnore, flag.ForceDelete},
 	})
 
-	listCmd := &cobra.Command{
+	listCmd := wrapper.SubCommand(&cobra.Command{
 		Use:   "list",
 		Short: "List all the resources that were created through this spec",
-		RunE:  wrapper.Wrapper(List),
-	}
-	wrapper.SetFlags(listCmd, flag.FlagSet{
+	}, List, flag.FlagSet{
 		Optional: []flag.Flag{flag.SpecDeployID, flag.SpecDir, flag.SpecIgnore, flag.AllNamespaces},
 	})
 

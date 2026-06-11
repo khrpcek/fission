@@ -32,12 +32,23 @@ manifests:
           builderNamespace: ""
           builderPodSpec.enabled: "false"
           canaryDeployment.enabled: "false"
+          coverage.enabled: "false"
           debugEnv: "false"
+          executor.enableOCIImageVolume: "false"
+          executor.functionServices.enabled: "true"
+          executor.specializationConcurrency: "0"
+          fetcher.allowInsecureRegistries: ""
           fetcher.imageTag: ""
           functionNamespace: ""
+          gatewayAPI.enabled: "false"
+          gatewayAPI.defaultParentRef: ""
           grafana.dashboards.enabled: "false"
           imageTag: ""
           influxdb.enabled: "false"
+          mcp.enabled: "true"
+          # Dev/CI clusters run without authentication, so opt into the
+          # unauthenticated MCP endpoint explicitly (the chart fails closed otherwise).
+          mcp.allowInsecure: "true"
           namespace: fission
           networkPolicy.enabled: "false"
           openTelemetry.otlpCollectorEndpoint: ""
@@ -50,6 +61,7 @@ manifests:
           priorityClassName: system-cluster-critical
           prometheus.serviceEndpoint: ""
           repository: ghcr.io
+          router.endpointSliceCache.mode: "on"
           routerServiceType: LoadBalancer
           runtimePodSpec.enabled: "false"
           serviceMonitor.additionalServiceMonitorLabels.release: prometheus
@@ -116,12 +128,47 @@ profiles:
       - op: replace
         path: /manifests/helm/releases/0/setValues/grafana.dashboards.enabled
         value: true
+      # Expose net/http/pprof on :6060 so the workflow can capture heap and
+      # goroutine profiles as post-run artifacts for memory-leak triage.
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/pprof.enabled
+        value: true
+      # Mount GOCOVERDIR into fission-bundle pods so the integration suite
+      # can collect Go binary coverage (paired with GOFLAGS=-cover at build
+      # time and a coverage collect step in the workflow). DEV/CI only.
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/coverage.enabled
+        value: true
       # Exercise the storagesvc NetworkPolicy in CI so a regression in its
       # selectors is caught before it reaches users with NetworkPolicy-aware
       # CNIs (kindnet enforces NetworkPolicy from kind v0.27 / k8s 1.30+).
       - op: replace
         path: /manifests/helm/releases/0/setValues/networkPolicy.enabled
         value: true
+      # Exercise the Gateway API route provider in CI (paired with an Envoy
+      # Gateway install + a Gateway in the fission namespace in push_pr.yaml,
+      # and the TEST_GATEWAY_PARENTREF-gated TestGatewayRoute).
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/gatewayAPI.enabled
+        value: true
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/gatewayAPI.defaultParentRef
+        value: fission/eg-gateway
+      # Trust the in-cluster plain-HTTP test registry for OCI package pulls
+      # (paired with the registry Deployment in push_pr.yaml and the
+      # FISSION_TEST_REGISTRY-gated TestOCIPackage* integration tests).
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/fetcher.allowInsecureRegistries
+        value: test-registry.default.svc.cluster.local:5000
+      # Opt into image-volume delivery (RFC-0001 Path B) on every leg: the
+      # executor's server-version gate keeps it inert below 1.33, and the
+      # Path B integration test additionally gates on FISSION_TEST_IMAGE_VOLUME.
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/executor.enableOCIImageVolume
+        value: true
+      # The RFC-0002 EndpointSlice data plane is on by chart default (phase 4);
+      # one workflow leg pins the router back to mode=off post-deploy so the
+      # legacy RPC path stays covered.
   - name: kind-ci-old
     patches:
       - op: replace

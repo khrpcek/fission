@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package newdeploy
 
 import (
@@ -8,20 +12,18 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
-	k8sCache "k8s.io/client-go/tools/cache"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	fetcherConfig "github.com/fission/fission/pkg/fetcher/config"
 	fClient "github.com/fission/fission/pkg/generated/clientset/versioned/fake"
-	genInformer "github.com/fission/fission/pkg/generated/informers/externalversions"
 	"github.com/fission/fission/pkg/utils"
 	"github.com/fission/fission/pkg/utils/loggerfactory"
-	"github.com/fission/fission/pkg/utils/manager"
 	"github.com/fission/fission/pkg/utils/uuid"
 )
 
@@ -36,27 +38,20 @@ const (
 
 func TestRefreshFuncPods(t *testing.T) {
 	os.Setenv("DEBUG_ENV", "true")
-	mgr := manager.New()
-	t.Cleanup(mgr.Wait)
+	mgr := &errgroup.Group{}
+	t.Cleanup(func() { _ = mgr.Wait() })
 	logger := loggerfactory.GetLogger()
 	kubernetesClient := fake.NewClientset()
 	// Hitting issue https://github.com/kubernetes/kubernetes/issues/126850
 	// so using NewSimpleClientset instead of NewClientset here, until that is resolved.
 	fissionClient := fClient.NewSimpleClientset() // nolint:staticcheck
-	factory := make(map[string]genInformer.SharedInformerFactory, 0)
-	factory[metav1.NamespaceDefault] = genInformer.NewSharedInformerFactoryWithOptions(fissionClient, time.Minute*30, genInformer.WithNamespace(metav1.NamespaceDefault))
-
-	executorLabel, err := utils.GetInformerLabelByExecutor(fv1.ExecutorTypeNewdeploy)
-	require.NoError(t, err, "Error creating labels for informer")
-	ndmInformerFactory := utils.GetInformerFactoryByExecutor(kubernetesClient, executorLabel, time.Minute*30)
 
 	ctx := t.Context()
 
 	fetcherConfig, err := fetcherConfig.MakeFetcherConfig("/userfunc")
 	require.NoError(t, err, "Error creating fetcher config")
 
-	executor, err := MakeNewDeploy(ctx, logger, fissionClient, kubernetesClient, fetcherConfig, "test",
-		factory, ndmInformerFactory, nil)
+	executor, err := MakeNewDeploy(ctx, logger, fissionClient, kubernetesClient, fetcherConfig, "test", nil)
 	require.NoError(t, err, "new deploy manager creation failed")
 
 	ndm := executor.(*NewDeploy)
@@ -68,31 +63,9 @@ func TestRefreshFuncPods(t *testing.T) {
 	}
 	ndm.nsResolver = &nsResolver
 
-	mgr.Add(ctx, func(ctx context.Context) {
-		ndm.Run(ctx, mgr)
-	})
-	t.Log("New deploy manager started")
-
-	for _, f := range factory {
-		f.Start(ctx.Done())
-	}
-	for _, informerFactory := range ndmInformerFactory {
-		informerFactory.Start(ctx.Done())
-	}
-
-	t.Log("Informers required for new deploy manager started")
-
-	waitSynced := make([]k8sCache.InformerSynced, 0)
-	for _, deplListerSynced := range ndm.deplListerSynced {
-		waitSynced = append(waitSynced, deplListerSynced)
-	}
-	for _, svcListerSynced := range ndm.svcListerSynced {
-		waitSynced = append(waitSynced, svcListerSynced)
-	}
-
-	if ok := k8sCache.WaitForCacheSync(ctx.Done(), waitSynced...); !ok {
-		t.Fatal("Timed out waiting for caches to sync")
-	}
+	// Deployment/Service reads now go through the Manager cache (IsValid only,
+	// which this test doesn't exercise); createFunction/RefreshFuncPods below use
+	// the kubernetesClient directly, so no informer factory is needed here.
 
 	envSpec := &fv1.Environment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -140,6 +113,22 @@ func TestRefreshFuncPods(t *testing.T) {
 	require.NoError(t, err, "Error getting function")
 	require.Equal(t, funcRes.Name, functionName)
 
+	// The Function watch is a controller-runtime reconciler now, which needs a
+	// Manager and is not running in this unit test. Drive createFunction directly
+	// (in a goroutine, as the old informer AddFunc handler did) so the deployment
+	// gets created. createFunction then blocks in waitForDeploy (the fake
+	// Deployment never reports AvailableReplicas), so give the goroutine its own
+	// cancelable context and cancel it once the Deployment exists — which is all
+	// this test waits for — so it exits promptly instead of sitting until
+	// SpecializationTimeout and logging after the test has moved on.
+	createCtx, cancelCreate := context.WithCancel(ctx)
+	t.Cleanup(cancelCreate)
+	go func() {
+		if _, err := ndm.createFunction(createCtx, funcRes); err != nil {
+			logger.Error(err, "error creating function in test")
+		}
+	}()
+
 	ctx2, cancel2 := context.WithCancel(t.Context())
 	wait.Until(func() {
 		t.Log("Checking for deployment")
@@ -150,6 +139,7 @@ func TestRefreshFuncPods(t *testing.T) {
 			cancel2()
 		}
 	}, time.Second*2, ctx2.Done())
+	cancelCreate() // deployment exists; stop the createFunction goroutine's waitForDeploy
 
 	err = BuildConfigMap(ctx, kubernetesClient, defaultNamespace, configmapName, map[string]string{
 		"test-key": "test-value",

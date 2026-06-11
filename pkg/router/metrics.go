@@ -1,6 +1,14 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 package router
 
 import (
+	"fmt"
+	"net/http"
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/fission/fission/pkg/utils/metrics"
@@ -30,11 +38,15 @@ var (
 		},
 		labelsStrings,
 	)
-	functionCallOverhead = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Name:       "fission_function_overhead_seconds",
-			Help:       "The function call delay caused by fission.",
-			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
+	functionCallOverhead = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name: "fission_function_overhead_seconds",
+			Help: "The function call delay caused by fission.",
+			// Histogram instead of Summary: a summary keeps a per-series quantile
+			// stream, and with these high-cardinality labels that was the largest
+			// router heap consumer. Buckets are fixed-size and aggregatable across
+			// replicas. Quantiles are derived with histogram_quantile().
+			Buckets: prometheus.DefBuckets,
 		},
 		labelsStrings,
 	)
@@ -45,4 +57,40 @@ func init() {
 	registry.MustRegister(functionCalls)
 	registry.MustRegister(functionCallErrors)
 	registry.MustRegister(functionCallOverhead)
+}
+
+// collectFunctionMetric records the per-call counters and the
+// Fission-attributed overhead histogram. Pure observation: the cached-address
+// tap that historically hid in here now fires from the ModifyResponse hook and
+// the proxy error handler, with identical ordering.
+func (fh functionHandler) collectFunctionMetric(start time.Time, rrt *RetryingRoundTripper, req *http.Request, resp *http.Response) {
+	duration := time.Since(start)
+	var path string
+
+	if fh.httpTrigger != nil {
+		if fh.httpTrigger.Spec.Prefix != nil && *fh.httpTrigger.Spec.Prefix != "" {
+			path = *fh.httpTrigger.Spec.Prefix
+		} else {
+			path = fh.httpTrigger.Spec.RelativeURL
+		}
+	}
+
+	functionCalls.WithLabelValues(fh.function.ObjectMeta.Namespace,
+		fh.function.ObjectMeta.Name, path, req.Method,
+		fmt.Sprint(resp.StatusCode)).Inc()
+
+	if resp.StatusCode >= 400 {
+		functionCallErrors.WithLabelValues(fh.function.ObjectMeta.Namespace,
+			fh.function.ObjectMeta.Name, path, req.Method,
+			fmt.Sprint(resp.StatusCode)).Inc()
+	}
+
+	functionCallOverhead.WithLabelValues(fh.function.ObjectMeta.Namespace,
+		fh.function.ObjectMeta.Name, path, req.Method,
+		fmt.Sprint(resp.StatusCode)).
+		Observe(float64(duration.Nanoseconds()) / 1e9)
+
+	fh.logger.V(1).Info("Request complete", "function", fh.function.Name,
+		"retry", rrt.totalRetry, "total-time", duration,
+		"content-length", resp.ContentLength)
 }

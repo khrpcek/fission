@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package environment
 
@@ -70,6 +58,16 @@ func (opts *CreateSubCommand) run(input cli.Input) (err error) {
 	// we use user provided NS in spec. While creating actual record we use the current context's NS.
 	opts.env.Namespace = userDefinedNS
 
+	// if we're writing a spec, don't call the API; validate then save/print.
+	// Handled before any API call so `--spec`/`--spec-dry` works without a cluster.
+	if input.Bool(flagkey.SpecDry) || input.Bool(flagkey.SpecSave) {
+		if err = opts.env.Validate(); err != nil {
+			return fv1.AggregateValidationErrors("Environment", err)
+		}
+		_, err = spec.SaveOrDry(input, *opts.env, fmt.Sprintf("env-%v.yaml", opts.env.Name))
+		return err
+	}
+
 	envList, err := opts.Client().FissionClientSet.CoreV1().Environments(opts.env.ObjectMeta.Namespace).List(input.Context(), metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -77,31 +75,6 @@ func (opts *CreateSubCommand) run(input cli.Input) (err error) {
 		console.Verbose(2, "%d environment(s) are present in the %s namespace.  "+
 			"These environments are not isolated from each other; use separate namespaces if you need isolation.",
 			len(envList.Items), opts.env.Namespace)
-	}
-
-	// if we're writing a spec, don't call the API
-	// save to spec file or display the spec to console
-	if input.Bool(flagkey.SpecDry) {
-		err = opts.env.Validate()
-		if err != nil {
-			return fv1.AggregateValidationErrors("Environment", err)
-		}
-
-		return spec.SpecDry(*opts.env)
-	}
-
-	if input.Bool(flagkey.SpecSave) {
-		err = opts.env.Validate()
-		if err != nil {
-			return fv1.AggregateValidationErrors("Environment", err)
-		}
-
-		specFile := fmt.Sprintf("env-%v.yaml", opts.env.Name)
-		err = spec.SpecSave(*opts.env, specFile, false)
-		if err != nil {
-			return fmt.Errorf("error saving environment spec: %w", err)
-		}
-		return nil
 	}
 
 	opts.env.Namespace = currentNS

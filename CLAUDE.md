@@ -14,10 +14,12 @@ Build / lint / test (run from repo root):
 - `make build-fission-cli` — build the `fission` CLI via goreleaser (snapshot, single target).
   `make install-fission-cli` copies it to `/usr/local/bin/fission`.
 - `make code-checks` — `golangci-lint run` (config in `.golangci.yaml`; goimports local prefix `github.com/fission/fission`).
-- `make test-run` — runs `hack/runtests.sh`: pulls `setup-envtest` Kubebuilder assets for k8s 1.30.x, then `go test -race -coverprofile=coverage.txt ./...`.
+- `make license` — add the SPDX header (`SPDX-FileCopyrightText` + `SPDX-License-Identifier: Apache-2.0`) to any in-scope source file (`.go`/`.sh`/`.py`/`Dockerfile*`) missing one.
+  `make license-check` is the CI gate (runs in `lint.yaml`); run it before pushing.
+- `make test-run` — runs `hack/runtests.sh`: pulls `setup-envtest` Kubebuilder assets for k8s 1.32.x, then `go test -race -coverprofile=coverage.txt ./...`.
   Requires `KUBEBUILDER_ASSETS` (the script sets it).
 - `make check` — full local gate: `test-run` + `build-fission-cli` + `clean`.
-- Run a single Go test: `go test -race -run TestName ./pkg/router/...` (set `KUBEBUILDER_ASSETS=$(go tool setup-envtest -p path use 1.30.x)` first if the package needs envtest).
+- Run a single Go test: `go test -race -run TestName ./pkg/router/...` (set `KUBEBUILDER_ASSETS=$(go tool setup-envtest -p path use 1.32.x)` first if the package needs envtest).
 
 Code generation (run after editing `pkg/apis/core/v1/types.go`):
 - `make codegen` — regenerates clientset/listers/informers under `pkg/generated/` (via `hack/update-codegen.sh`) and deepcopy via controller-gen.
@@ -39,16 +41,25 @@ kubectl port-forward svc/router-internal 8889:8889 -n fission &
 - The internal forward is required because `/fission-function/<ns>/<name>` moved off the public listener after GHSA-3g33-6vg6-27m8 (see Architecture).
   Tests that invoke functions go through the framework's `Router(t)` HTTP client which auto-routes those paths to 8889, or dial the URL from `f.RouterInternalBaseURL()` directly.
 - Export `FISSION_INTERNAL_AUTH_SECRET` (read from `kubectl get secret fission-internal-auth -n fission -o jsonpath='{.data.master}' | base64 -d`) so the framework's transport signs requests on the internal listener — leave unset to test the verifier's pass-through mode.
+- The MCP test (`TestMCPToolsListAndCall`) needs `svc/mcp` reachable: `kubectl port-forward svc/mcp 8890:8890 -n fission &` and `FISSION_MCP_BASE_URL=http://127.0.0.1:8890` (the framework defaults to that); it `t.Skip`s when the endpoint is unreachable. `mcp.enabled`/`mcp.allowInsecure` are on in the kind/kind-ci skaffold profiles.
 - Run the full suite: `go test -tags=integration -timeout=30m -parallel 6 -v ./test/integration/suites/common/...`.
   Set runtime/builder image env vars (`NODE_RUNTIME_IMAGE`, `PYTHON_RUNTIME_IMAGE`, etc.) — tests `t.Skip` when their required image is unset.
   `TEST_NOCLEANUP=1` leaves resources for debugging.
 - Run a single test: `go test -tags=integration -run TestNodeHelloHTTP -v ./test/integration/suites/common/...`.
+- `suites/serial/` holds tests that mutate cluster-wide control-plane state (e.g. restarting the executor to exercise `AdoptExistingResources`) and so cannot run alongside the parallel `common` suite.
+  CI runs them after `common/` in the same step (reusing the port-forwards), single-package: `go test -tags=integration -p 1 ./test/integration/suites/serial/...`.
+  Restart the executor via `framework.SetExecutorEnv` + `WaitForExecutorRollout` (a completed rollout means the new pod's adopt pass has run, since `/readyz` gates on `cachesSynced`, set after `runAdoptCleanup`).
 - Framework reference + "Adding a new test" 12-step guide: `docs/test-migration/02-framework-api.md`.
 - The previous bash test suite (`test/tests/`, `test/run_test.sh`, `test/kind_CI.sh`, `test/utils.sh`, etc.) was retired in 2026-05; the migration history lives in `docs/test-migration/`.
 
+## Testing conventions
+
+When writing or modifying tests, follow `.claude/resources/test-writing-guidelines.md`.
+Key points: use `testify` (`require` for preconditions, `assert` for independent checks) over hand-written comparisons; use `t.Context()` instead of `context.Background()`; prefer fake clientsets over `envtest` for unit tests; table-driven subtests with `t.Parallel()`.
+
 ## Architecture
 
-`cmd/fission-bundle/main.go` is the dispatch point — the same binary becomes a different service depending on which `--<flag>` is passed (`--routerPort`, `--executorPort`, `--kubewatcher`, `--timer`, `--mqt`, `--mqt_keda`, `--builderMgr`, `--canaryConfig`, `--webhookPort`, `--storageServicePort`, `--logger`).
+`cmd/fission-bundle/main.go` is the dispatch point — the same binary becomes a different service depending on which `--<flag>` is passed (`--routerPort`, `--executorPort`, `--kubewatcher`, `--timer`, `--mqt`, `--mqt_keda`, `--builderMgr`, `--canaryConfig`, `--webhookPort`, `--storageServicePort`, `--mcpPort`, `--logger`).
 Each flag dispatches to a `Start` function in the corresponding `pkg/` package.
 The Helm chart deploys this binary multiple times with different flags.
 Other binaries: `cmd/fission-cli` (user CLI), `cmd/builder` (per-env build sidecar), `cmd/fetcher` (per-env code-fetch sidecar), `cmd/preupgradechecks`, `cmd/reporter`.
@@ -68,6 +79,18 @@ The internal listener is wrapped with `pkg/auth/hmac.ServiceVerifier` (key deriv
 Other trigger paths invoke the router URL: `pkg/kubewatcher` (watches arbitrary k8s resources), `pkg/timer` (cron), `pkg/mqtrigger` (Kafka/NATS/etc., plus a KEDA-driven scaler manager via `--mqt_keda`), `pkg/canaryconfigmgr` (gradual traffic shifting between two functions on an HTTPTrigger).
 They publish to `/fission-function/...` on the internal listener; `cmd/fission-bundle/main.go` resolves `ROUTER_INTERNAL_URL` from the env once and forwards it as the `routerUrl` argument into each subsystem's `Start` function — keep library constructors like `publisher.MakeWebhookPublisher` deterministic (no env reads) so unit tests with `httptest.Server` aren't broken.
 
+MCP subsystem (`pkg/mcp`, `--mcpPort`): exposes opted-in Functions as Model Context Protocol tools for LLM agents over the official `github.com/modelcontextprotocol/go-sdk` Streamable HTTP transport (`/mcp` on the ClusterIP-only `svc/mcp`, Helm `mcp.enabled`, off by default).
+A function opts in via the optional `FunctionSpec.Tool *ToolConfig` field (presence is the on switch, like `Streaming`; `Description` + raw-JSON `InputSchema` + optional `ToolName`).
+`Start` mirrors `pkg/timer` but runs **without** leader election — every replica reconciles `Function` CRDs into its own in-memory `*mcp.Registry` and serves the full tool list, so each must reconcile (the SDK's `*mcp.Server` mutex serializes `AddTool`/`RemoveTools` against serving).
+`tools/call` is **buffered, not streamed** (the SDK returns one `CallToolResult`) and is proxied to `/fission-function/...` on the router internal listener built with `utils.UrlForFunction` (which **folds the default namespace** to `/fission-function/<name>`) and signed with the same `ServiceRouterInternal` HMAC key as the other publishers.
+AuthZ: bearer JWT (`JWT_SIGNING_KEY`, shared with the router secret) whose `allowed_namespaces` claim scopes `tools/list`/`tools/call`; it **fails closed** — `Start` refuses to run without a key unless `MCP_ALLOW_INSECURE=true`, and the chart fails render when `mcp.enabled && !authentication.enabled && !mcp.allowInsecure`.
+RBAC is read-only on functions + functions/status; `/readyz` gates on the Function cache sync (via a manager `RunnableFunc`) so a warming replica isn't added to the Service.
+
+EndpointSlice data plane (RFC-0002, ON by default since phase 4): with `executor.functionServices.enabled` (default true) + `router.endpointSliceCache.mode=on` (default; `off` keeps the legacy executor-RPC plane, the migration-era `shadow` mode was removed), the router serves poolmgr **warm** traffic from a slice-fed endpoint index (`pkg/router/endpointcache`, one label-filtered EndpointSlice informer per replica, no leader election) instead of RPC-ing the executor per request — "router admits, executor provisions".
+The executor creates an async headless selector Service per invoked poolmgr function (`fn-<name>-<uid8>`, `pkg/executor/executortype/poolmgr/gp_service.go`); the built-in EndpointSlice controller publishes specialized pods via the `fission.io/served` + `fission.io/function-generation` labels, which ride the two existing pod patches — the cold-start path (synchronous `getServiceForFunction` RPC, ~100ms budget) is byte-identical with gates on or off.
+Address resolution is behind `AddressResolver` (`pkg/router/resolver*.go`): `mode=on` wires `fallbackResolver` (index admit → `/v2/ensureCapacity` on saturation → legacy RPC on miss/strict/degrade); `router.endpointSliceCache.endpointLB` (default false) additionally dials newdeploy/container pod IPs directly with least-outstanding spread, tapping the Service address (`ResolvedEntry.TapURL`) so idle scale-down accounting stays correct.
+One non-coverage CI leg pins the gates off post-deploy (the "Pin legacy data plane" step in `push_pr.yaml`) so the legacy path stays covered; the PoolCache admission arms and `functionServiceMap` deliberately survive phase 4 because mode=off, strict mode, and cold starts still drive them.
+
 CRDs live in `pkg/apis/core/v1/` (`Function`, `Package`, `Environment`, `HTTPTrigger`, `KubernetesWatchTrigger`, `MessageQueueTrigger`, `TimeTrigger`, `CanaryConfig`).
 Validation lives in the same package (`validation.go`).
 When adding a new CRD type, follow the 10-step checklist in the comment at the top of `pkg/apis/core/v1/types.go` (create spec → type → list → register → CRUD interface → regenerate).
@@ -86,3 +109,11 @@ The CLI (`cmd/fission-cli` + `pkg/fission-cli/`) talks to Kubernetes directly th
 - `skaffold-deploy` depends on `skaffold-prebuild`, which builds linux/amd64 binaries with goreleaser into `dist/` and copies Dockerfiles in.
   If a build looks stale, `make clean` and rerun.
 - E2E tests on macOS require GNU coreutils on `PATH` — BSD versions silently behave differently.
+- New source files need an SPDX license header or the `lint` CI job fails (`make license-check`).
+  Run `make license` to add it (template in `hack/license-header.tmpl`); the legacy 15-line Apache block is gone — do not reintroduce it.
+  Generated code gets its header from `hack/boilerplate.go.txt`, so that file (not the output) is the source of truth for generated headers.
+- Any **new pod that calls the router internal listener** (port 8889) must be added to the `from` allowlist in `charts/fission-all/templates/router/networkpolicy.yaml` by its `svc:` label — `networkPolicy.enabled=true` in kind-ci, so a missing entry surfaces only in CI as `dial tcp <clusterIP>:8889: i/o timeout` (the request is silently dropped, not refused). This is how the MCP pod (`svc: mcp`) was wired.
+- When building a `/fission-function/<ns>/<name>` URL in Go, use `utils.UrlForFunction(name, namespace)` — it **folds the default namespace** to `/fission-function/<name>`, which is the form the router actually registers. A hardcoded `/fission-function/default/<name>` does not resolve.
+- MCP test pod logs live in the `fission` namespace, which the integration-test diagnostics dump (scoped to `default`) does NOT capture — pull the CI `kind-logs-<run>-<ver>` artifact and read `.../containers/mcp-*.log` instead.
+- Poolmgr request accounting has **two disjoint modes that must never mix**: router-admitted requests (index `Admit`) decrement via the `ResolvedEntry.Release` closure, executor-resolved requests via the UnTap RPC into `PoolCache.activeRequests`. Calling Release for an executor-resolved entry (or skipping UnTap for one) corrupts the executor's concurrency accounting — when touching `pkg/router/transport.go` or the resolvers, check which mode owns the entry (`Release != nil` ⟺ router-admitted).
+- `EXECUTOR_SPECIALIZATION_CONCURRENCY` bounds **one semaphore shared by all executor types**: a small bound lets newdeploy's minutes-long `waitForDeployment` holds starve poolmgr's ~100ms specializations (head-of-line blocking; surfaced as mass cold-start timeouts in CI). Leave it 0 (unbounded) unless poolmgr-only pressure is the proven problem.

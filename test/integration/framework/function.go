@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build integration
 
 package framework
@@ -49,6 +53,26 @@ type FunctionOptions struct {
 	// FnTimeout, when > 0, is passed as `--fntimeout <n>` (seconds).
 	// Sets the function's invocation timeout; default 60s.
 	FnTimeout int
+	// Streaming, when true, passes `--streaming` so the router streams the
+	// response (SSE/chunked/WebSocket) and does not cut it at FnTimeout.
+	Streaming bool
+	// StreamingProtocol, when set with Streaming, passes `--streamingprotocol`
+	// (auto|sse|chunked|websocket).
+	StreamingProtocol string
+	// StreamingMaxDuration, when > 0 with Streaming, passes
+	// `--streamingmaxduration <n>` (seconds) — a hard ceiling on stream lifetime.
+	StreamingMaxDuration int
+	// ExposeAsMCP, when true, passes `--expose-as-mcp` so the function is
+	// advertised as an MCP tool.
+	ExposeAsMCP bool
+	// ToolDescription, when set with ExposeAsMCP, passes `--tool-description`.
+	ToolDescription string
+	// ToolName, when set with ExposeAsMCP, passes `--tool-name` (overrides the
+	// default <namespace>-<name>).
+	ToolName string
+	// ToolInputSchema, when set with ExposeAsMCP, passes `--tool-input-schema`
+	// (a path to a JSON Schema file).
+	ToolInputSchema string
 	// ExecutorType, when set, picks the function's executor backend
 	// ("poolmgr" — default — or "newdeploy").
 	ExecutorType string
@@ -121,6 +145,27 @@ func (ns *TestNamespace) CreateFunction(t *testing.T, ctx context.Context, opts 
 	if opts.FnTimeout > 0 {
 		args = append(args, "--fntimeout", strconv.Itoa(opts.FnTimeout))
 	}
+	if opts.Streaming {
+		args = append(args, "--streaming")
+		if opts.StreamingProtocol != "" {
+			args = append(args, "--streamingprotocol", opts.StreamingProtocol)
+		}
+		if opts.StreamingMaxDuration > 0 {
+			args = append(args, "--streamingmaxduration", strconv.Itoa(opts.StreamingMaxDuration))
+		}
+	}
+	if opts.ExposeAsMCP {
+		args = append(args, "--expose-as-mcp")
+		if opts.ToolDescription != "" {
+			args = append(args, "--tool-description", opts.ToolDescription)
+		}
+		if opts.ToolName != "" {
+			args = append(args, "--tool-name", opts.ToolName)
+		}
+		if opts.ToolInputSchema != "" {
+			args = append(args, "--tool-input-schema", opts.ToolInputSchema)
+		}
+	}
 	if opts.ExecutorType != "" {
 		args = append(args, "--executortype", opts.ExecutorType)
 	}
@@ -169,6 +214,46 @@ func (ns *TestNamespace) CreateFunction(t *testing.T, ctx context.Context, opts 
 					return delErr
 				}
 			}
+		}
+		return nil
+	})
+}
+
+// ContainerFunctionOptions are the inputs to CreateContainerFunction.
+type ContainerFunctionOptions struct {
+	// Name of the Function CR. Required.
+	Name string
+	// Image is the user container image to run. Required. It must serve HTTP
+	// on Port (the container executor invokes it directly, with no env pod).
+	Image string
+	// Port the image listens on (CLI `--port`); default 8888 when 0.
+	Port int
+	// ConfigMaps attaches configmaps by name (CLI `--configmap`, repeatable).
+	// Their keys are injected as env vars into the container.
+	ConfigMaps []string
+}
+
+// CreateContainerFunction creates a container-executor function via
+// `fission function run-container`. Unlike CreateFunction this needs no
+// environment or package — the user image is the runtime. Cleanup deletes
+// the Function.
+func (ns *TestNamespace) CreateContainerFunction(t *testing.T, ctx context.Context, opts ContainerFunctionOptions) {
+	t.Helper()
+	require.NotEmpty(t, opts.Name, "ContainerFunctionOptions.Name")
+	require.NotEmpty(t, opts.Image, "ContainerFunctionOptions.Image")
+
+	args := []string{"fn", "run-container", "--name", opts.Name, "--image", opts.Image}
+	if opts.Port > 0 {
+		args = append(args, "--port", strconv.Itoa(opts.Port))
+	}
+	for _, cm := range opts.ConfigMaps {
+		args = append(args, "--configmap", cm)
+	}
+	ns.CLI(t, ctx, args...)
+
+	ns.addCleanup("function "+opts.Name, func(c context.Context) error {
+		if err := ns.f.fissionClient.CoreV1().Functions(ns.Name).Delete(c, opts.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return err
 		}
 		return nil
 	})

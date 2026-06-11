@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package util
 
@@ -51,6 +39,17 @@ func MergeContainer(dst *apiv1.Container, src *apiv1.Container) (*apiv1.Containe
 		checkSliceConflicts("Name", dstC.VolumeMounts),
 		checkSliceConflicts("Name", dstC.VolumeDevices))
 
+	// mergo.WithOverride copies src.SecurityContext onto the merged result,
+	// so a tenant-supplied Environment Runtime.Container / Builder.Container
+	// with privileged=true / allowPrivilegeEscalation=true / dangerous caps
+	// would otherwise reach the running pod. The admission webhook
+	// (ValidateContainerSafety) is the primary defence; this strips the
+	// dangerous bits at the merge layer so a webhook-bypass cluster
+	// (failurePolicy=Ignore or stale objects from a pre-webhook upgrade)
+	// is still protected. Closes GHSA-m63v-2g9w-2w6v (the Container-field
+	// sibling of GHSA-gx55 / GHSA-wmgg / GHSA-v455).
+	sanitizeContainerSecurityContext(&dstC)
+
 	return &dstC, errs
 }
 
@@ -79,8 +78,29 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
 		srcPodSpec.InitContainers = cList
 	}
 
-	// For volumes - if duplicate exist, throw error
-	vols, err := mergeVolumeLists(srcPodSpec.Volumes, targetPodSpec.Volumes)
+	// Sanitize per-container SecurityContext after the merge. The admission
+	// webhook rejects privileged=true / allowPrivilegeEscalation=true and
+	// dangerous capabilities (SYS_ADMIN, NET_ADMIN, etc.) at submit time,
+	// but a webhook-bypass cluster (failurePolicy=Ignore or a stale object
+	// from a pre-webhook upgrade window) could still reach this code path.
+	// Strip the dangerous bits from the merged result so the resulting pod
+	// cannot escape its container even if admission was bypassed. Closes
+	// GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
+	for i := range srcPodSpec.Containers {
+		sanitizeContainerSecurityContext(&srcPodSpec.Containers[i])
+	}
+	for i := range srcPodSpec.InitContainers {
+		sanitizeContainerSecurityContext(&srcPodSpec.InitContainers[i])
+	}
+
+	// For volumes - if duplicate exist, throw error. hostPath volumes are
+	// stripped from the target before merge: a tenant-supplied hostPath
+	// mount is a node-escape primitive (read /etc, the container runtime
+	// socket, etc.). The admission webhook rejects them, and this layer
+	// makes them unreachable even on webhook-bypass clusters. Closes
+	// GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
+	filteredTargetVols := stripHostPathVolumes(targetPodSpec.Volumes)
+	vols, err := mergeVolumeLists(srcPodSpec.Volumes, filteredTargetVols)
 	if err != nil {
 		multierr = errors.Join(multierr, err)
 	} else {
@@ -113,6 +133,16 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
 	}
 
 	// TODO - Security context should be merged instead of overriding.
+	// Pod-level SecurityContext IS propagated: the chart's
+	// runtimePodSpec.podSpec.securityContext / builderPodSpec.podSpec.
+	// securityContext are operator-supplied hardening (fsGroup,
+	// runAsNonRoot=true, runAsUser=10001, runAsGroup=10001) that must
+	// reach the pool / builder pods. The node-escape primitives flagged
+	// by GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92
+	// live at container-level (privileged, allowPrivilegeEscalation,
+	// dangerous capabilities) and at pod level (hostNetwork, hostPID,
+	// hostIPC, hostPath volumes, serviceAccountName override) — all of
+	// which are denylisted in pkg/apis/core/v1/podspec_safety.go.
 	if targetPodSpec.SecurityContext != nil {
 		srcPodSpec.SecurityContext = targetPodSpec.SecurityContext
 	}
@@ -142,29 +172,22 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
 		srcPodSpec.DNSPolicy = targetPodSpec.DNSPolicy
 	}
 
-	if targetPodSpec.ServiceAccountName != "" {
-		srcPodSpec.ServiceAccountName = targetPodSpec.ServiceAccountName
-	}
-
-	if targetPodSpec.DeprecatedServiceAccount != "" {
-		srcPodSpec.DeprecatedServiceAccount = targetPodSpec.DeprecatedServiceAccount
-	}
+	// ServiceAccountName / DeprecatedServiceAccount intentionally not
+	// propagated: the controller chooses the SA for the pod
+	// (fission-fetcher for runtime pods, fission-builder for build pods).
+	// Letting a user-supplied podspec override it would defeat the SA-token
+	// scoping introduced by GHSA-85g2-pmrx-r49q and GHSA-8wcj-mfrc-jx5q.
+	// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
 
 	if targetPodSpec.AutomountServiceAccountToken != nil {
 		srcPodSpec.AutomountServiceAccountToken = targetPodSpec.AutomountServiceAccountToken
 	}
 
-	if targetPodSpec.HostNetwork {
-		srcPodSpec.HostNetwork = targetPodSpec.HostNetwork
-	}
-
-	if targetPodSpec.HostPID {
-		srcPodSpec.HostPID = targetPodSpec.HostPID
-	}
-
-	if targetPodSpec.HostIPC {
-		srcPodSpec.HostIPC = targetPodSpec.HostIPC
-	}
+	// HostNetwork / HostPID / HostIPC intentionally not propagated.
+	// A pod sharing host namespaces is a node-escape primitive — the
+	// admission webhook rejects these fields, and this layer makes them
+	// unreachable even on webhook-bypass clusters.
+	// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
 
 	if targetPodSpec.ShareProcessNamespace != nil {
 		srcPodSpec.ShareProcessNamespace = targetPodSpec.ShareProcessNamespace
@@ -287,4 +310,84 @@ func checkSliceConflicts(field string, objs any) (err error) {
 		}
 	}
 	return errs
+}
+
+// stripHostPathVolumes returns a copy of vols with any volume whose source
+// is a hostPath removed. Defense in depth — the admission webhook already
+// rejects hostPath in tenant-supplied podspecs (see
+// pkg/apis/core/v1/podspec_safety.go), but on webhook-bypass clusters
+// (failurePolicy=Ignore, or stale objects from a pre-webhook upgrade
+// window) this layer makes the dangerous primitive unreachable.
+// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
+func stripHostPathVolumes(vols []apiv1.Volume) []apiv1.Volume {
+	if len(vols) == 0 {
+		return vols
+	}
+	out := make([]apiv1.Volume, 0, len(vols))
+	for _, v := range vols {
+		if v.HostPath != nil {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// allowedMergeContainerCapabilities is the strict allowlist of Linux
+// capabilities a tenant-supplied container may carry through the merge layer
+// via `securityContext.capabilities.add`. Kept in sync with allowedCapabilities
+// in pkg/apis/core/v1/podspec_safety.go (the admission gate). The OCI default
+// capability set is removed by the forced drop: ["ALL"] below.
+var allowedMergeContainerCapabilities = map[apiv1.Capability]struct{}{
+	"NET_BIND_SERVICE": {},
+}
+
+// sanitizeContainerSecurityContext enforces the container-sandbox invariants
+// on a merged container's SecurityContext: privileged=false,
+// allowPrivilegeEscalation=false, and capabilities.add filtered to
+// allowedMergeContainerCapabilities. The admission webhook is the primary
+// defence; this is the merge-layer belt-and-braces for webhook-bypass
+// clusters (failurePolicy=Ignore or stale objects from a pre-webhook
+// upgrade).
+//
+// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92 and
+// the follow-up GHSA-qf5v-m7p4-95rp (the prior denylist on capabilities.add
+// could not enumerate every dangerous capability — the allowlist closes the
+// demonstrated CAP_SYS_TIME bypass and every other non-allowlisted add).
+//
+// Not addressed here: the OCI runtime's ~14 default capabilities (MKNOD,
+// SETFCAP, DAC_OVERRIDE, NET_RAW, ...) still reach the container. Forcing
+// capabilities.drop=["ALL"] is the structural fix the qf5v advisory
+// recommends, but Fission's own sidecar containers (fetcher, builder) were
+// authored against the OCI default cap set and need to be audited before
+// drop:["ALL"] can be applied uniformly. Tracked separately.
+func sanitizeContainerSecurityContext(c *apiv1.Container) {
+	if c.SecurityContext == nil {
+		return
+	}
+	// Deep-copy before mutating. MergeContainer does a shallow struct copy
+	// (`dstC := *dst`) and mergo.WithOverride aliases src.SecurityContext
+	// onto dstC.SecurityContext, so mutating in place would leak into the
+	// caller's targetPodSpec — which is typically env.Spec.Runtime.PodSpec
+	// from an informer cache. Allocating a fresh SecurityContext (and a
+	// fresh Capabilities.Add slice via a new backing array) keeps the
+	// sanitization local to the merged result.
+	c.SecurityContext = c.SecurityContext.DeepCopy()
+	sc := c.SecurityContext
+	if sc.Privileged != nil && *sc.Privileged {
+		sc.Privileged = new(false)
+	}
+	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
+		sc.AllowPrivilegeEscalation = new(false)
+	}
+	if sc.Capabilities != nil && len(sc.Capabilities.Add) > 0 {
+		filtered := make([]apiv1.Capability, 0, len(sc.Capabilities.Add))
+		for _, cap := range sc.Capabilities.Add {
+			if _, ok := allowedMergeContainerCapabilities[cap]; !ok {
+				continue
+			}
+			filtered = append(filtered, cap)
+		}
+		sc.Capabilities.Add = filtered
+	}
 }

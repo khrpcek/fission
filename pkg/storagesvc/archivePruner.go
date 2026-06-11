@@ -1,18 +1,6 @@
-/*
-Copyright 2017 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package storagesvc
 
@@ -24,24 +12,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
 	"github.com/fission/fission/pkg/utils"
-	"github.com/fission/fission/pkg/utils/manager"
 )
 
 type ArchivePruner struct {
 	logger        logr.Logger
 	crdClient     versioned.Interface
 	archiveChan   chan string
-	stowClient    *StowClient
+	storageClient *StorageClient
 	pruneInterval time.Duration
 }
 
 const defaultPruneInterval int = 60 // in minutes
 
-func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterface, stowClient *StowClient, pruneInterval time.Duration) (*ArchivePruner, error) {
+func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterface, storageClient *StorageClient, pruneInterval time.Duration) (*ArchivePruner, error) {
 	fissionClient, err := clientGen.GetFissionClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get fission client: %w", err)
@@ -51,7 +39,7 @@ func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterfac
 		logger:        logger.WithName("archive_pruner"),
 		crdClient:     fissionClient,
 		archiveChan:   make(chan string),
-		stowClient:    stowClient,
+		storageClient: storageClient,
 		pruneInterval: pruneInterval,
 	}, nil
 }
@@ -64,7 +52,7 @@ func (pruner *ArchivePruner) pruneArchives(ctx context.Context) {
 		case archiveID := <-pruner.archiveChan:
 			pruner.logger.Info("sending delete request for archive",
 				"archive_id", archiveID)
-			if err := pruner.stowClient.removeFileByID(archiveID); err != nil {
+			if err := pruner.storageClient.removeFileByID(archiveID); err != nil {
 				// logging the error and continuing with other deletions.
 				// hopefully this archive will be deleted in the next iteration.
 				pruner.logger.Error(err, "ignoring error while deleting archive", "archive_id", archiveID)
@@ -124,7 +112,7 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	// get all archives on storage
 	// out of them, there may be some just created but not referenced by packages yet.
 	// need to filter them out.
-	archivesInStorage, err := pruner.stowClient.getItemIDsWithFilter(pruner.stowClient.filterItemCreatedAMinuteAgo, time.Now())
+	archivesInStorage, err := pruner.storageClient.getItemIDsWithFilter(pruner.storageClient.filterItemCreatedAMinuteAgo, time.Now())
 	if err != nil {
 		pruner.logger.Error(err, "error getting items from storage")
 		return
@@ -145,11 +133,12 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 // Start starts a go routine that listens to a channel for archive IDs that need to deleted.
 // Also wakes up at regular intervals to make a list of archive IDs that need to be reaped
 // and sends them over to the channel for deletion
-func (pruner *ArchivePruner) Start(ctx context.Context, mgr manager.Interface) {
+func (pruner *ArchivePruner) Start(ctx context.Context, mgr *errgroup.Group) {
 	ticker := time.NewTicker(pruner.pruneInterval * time.Minute)
 	defer ticker.Stop()
-	mgr.Add(ctx, func(ctx context.Context) {
+	mgr.Go(func() error {
 		pruner.pruneArchives(ctx)
+		return nil
 	})
 	for {
 		select {

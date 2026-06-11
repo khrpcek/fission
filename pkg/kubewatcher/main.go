@@ -1,18 +1,6 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package kubewatcher
 
@@ -21,13 +9,16 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/publisher"
-	"github.com/fission/fission/pkg/utils/manager"
+	"github.com/fission/fission/pkg/utils/crmanager"
 )
 
-func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, mgr manager.Interface, routerUrl string) error {
+func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, _ *errgroup.Group, routerUrl string) error {
 	fissionClient, err := clientGen.GetFissionClient()
 	if err != nil {
 		return fmt.Errorf("failed to get fission client: %w", err)
@@ -36,6 +27,10 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	if err != nil {
 		return fmt.Errorf("failed to get kubernetes client: %w", err)
 	}
+	restConfig, err := clientGen.GetRestConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get rest config: %w", err)
+	}
 
 	err = crd.WaitForFunctionCRDs(ctx, logger, fissionClient)
 	if err != nil {
@@ -43,12 +38,24 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	}
 
 	poster := publisher.MakeWebhookPublisher(logger, routerUrl)
-	kubeWatch := MakeKubeWatcher(ctx, logger, fissionClient, kubeClient, poster)
-	ws, err := MakeWatchSync(ctx, logger, fissionClient, kubeWatch)
-	if err != nil {
-		return fmt.Errorf("error making watch sync: %w", err)
-	}
-	ws.Run(ctx, mgr)
+	kubeWatch := MakeKubeWatcher(ctx, logger, kubeClient, poster)
 
-	return nil
+	// Active-passive HA via native controller-runtime leader election: only the
+	// elected leader registers watches, so two replicas don't double-register /
+	// double-fire functions. No-op when LEADER_ELECTION_ENABLED is unset
+	// (single-replica default). The reconciler watches through the Manager's
+	// namespace-scoped cache and runs only on the elected leader.
+	crMgr, err := crmanager.NewLeaderElected(restConfig, "fission-kubewatcher", logger)
+	if err != nil {
+		return err
+	}
+	r := &KubernetesWatchTriggerReconciler{
+		logger:      logger.WithName("kuberneteswatchtrigger_reconciler"),
+		client:      crMgr.GetClient(),
+		kubeWatcher: kubeWatch,
+	}
+	if err := controller.Register(crMgr, &fv1.KubernetesWatchTrigger{}, r, "kuberneteswatchtrigger"); err != nil {
+		return fmt.Errorf("error registering kuberneteswatchtrigger reconciler: %w", err)
+	}
+	return crMgr.Start(ctx)
 }

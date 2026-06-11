@@ -1,28 +1,13 @@
-/*
-Copyright 2022.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package webhook
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/go-logr/logr"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -31,6 +16,13 @@ import (
 // Validator is an interface that can be implemented to provide custom validation logic.
 type Validator[T client.Object] interface {
 	Validate(T) error
+}
+
+// Warner is an optional facet: a validator that also attaches non-fatal
+// admission warnings (surfaced by kubectl/clients) for accepted-but-suspect
+// specs, e.g. an annotation value that silently means "default".
+type Warner[T client.Object] interface {
+	Warnings(T) admission.Warnings
 }
 
 // Defaulter is an interface that can be implemented to provide custom defaulting logic.
@@ -43,60 +35,55 @@ type GenericWebhook[T client.Object] struct {
 	Logger    logr.Logger
 	Validator Validator[T]
 	Defaulter Defaulter[T]
+	Warner    Warner[T]
 }
 
 // SetupWebhookWithManager sets up the webhook with the manager.
 func (w *GenericWebhook[T]) SetupWebhookWithManager(mgr ctrl.Manager, obj T) error {
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(obj).
+	return ctrl.NewWebhookManagedBy(mgr, obj).
 		WithDefaulter(w).
 		WithValidator(w).
 		Complete()
 }
 
-// Default implements webhook.CustomDefaulter.
-func (w *GenericWebhook[T]) Default(_ context.Context, obj runtime.Object) error {
+// Default implements admission.Defaulter.
+func (w *GenericWebhook[T]) Default(_ context.Context, obj T) error {
 	if w.Defaulter == nil {
 		return nil
 	}
-	typedObj, ok := obj.(T)
-	if !ok {
-		var t T
-		return apierrors.NewBadRequest(fmt.Sprintf("expected %T but got %T", t, obj))
-	}
-	w.Logger.V(1).Info("default", "name", typedObj.GetName())
-	return w.Defaulter.ApplyDefaults(typedObj)
+	w.Logger.V(1).Info("default", "name", obj.GetName())
+	return w.Defaulter.ApplyDefaults(obj)
 }
 
-// ValidateCreate implements webhook.CustomValidator.
-func (w *GenericWebhook[T]) ValidateCreate(_ context.Context, obj runtime.Object) (admission.Warnings, error) {
-	typedObj, ok := obj.(T)
-	if !ok {
-		var t T
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected %T but got %T", t, obj))
-	}
-	w.Logger.V(1).Info("validate create", "name", typedObj.GetName())
+// ValidateCreate implements admission.Validator.
+func (w *GenericWebhook[T]) ValidateCreate(_ context.Context, obj T) (admission.Warnings, error) {
+	w.Logger.V(1).Info("validate create", "name", obj.GetName())
+	// Warnings are independent of Validator: a webhook may warn without
+	// rejecting anything, and gating them on Validator would silently drop
+	// the warnings such a webhook was written to emit.
 	if w.Validator != nil {
-		return nil, w.Validator.Validate(typedObj)
+		return w.warnings(obj), w.Validator.Validate(obj)
 	}
-	return nil, nil
+	return w.warnings(obj), nil
 }
 
-// ValidateUpdate implements webhook.CustomValidator.
-func (w *GenericWebhook[T]) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	typedObj, ok := newObj.(T)
-	if !ok {
-		var t T
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected %T but got %T", t, newObj))
-	}
-	w.Logger.V(1).Info("validate update", "name", typedObj.GetName())
+// ValidateUpdate implements admission.Validator.
+func (w *GenericWebhook[T]) ValidateUpdate(_ context.Context, _, newObj T) (admission.Warnings, error) {
+	w.Logger.V(1).Info("validate update", "name", newObj.GetName())
 	if w.Validator != nil {
-		return nil, w.Validator.Validate(typedObj)
+		return w.warnings(newObj), w.Validator.Validate(newObj)
 	}
-	return nil, nil
+	return w.warnings(newObj), nil
 }
 
-// ValidateDelete implements webhook.CustomValidator.
-func (w *GenericWebhook[T]) ValidateDelete(_ context.Context, _ runtime.Object) (admission.Warnings, error) {
+func (w *GenericWebhook[T]) warnings(obj T) admission.Warnings {
+	if w.Warner == nil {
+		return nil
+	}
+	return w.Warner.Warnings(obj)
+}
+
+// ValidateDelete implements admission.Validator.
+func (w *GenericWebhook[T]) ValidateDelete(_ context.Context, _ T) (admission.Warnings, error) {
 	return nil, nil
 }

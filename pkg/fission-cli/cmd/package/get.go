@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package _package
 
@@ -64,7 +52,7 @@ func (opts *GetSubCommand) complete(input cli.Input) (err error) {
 	opts.name = input.String(flagkey.PkgName)
 	_, opts.namespace, err = opts.GetResourceNamespace(input, flagkey.NamespacePackage)
 	if err != nil {
-		return fv1.AggregateValidationErrors("Environment", err)
+		return fv1.AggregateValidationErrors("Package", err)
 	}
 	opts.output = input.String(flagkey.PkgOutput)
 	return nil
@@ -92,6 +80,12 @@ func (opts *GetSubCommand) run(input cli.Input) error {
 		}
 		defer readCloser.Close()
 		reader = readCloser
+	case fv1.ArchiveTypeOCI:
+		return fmt.Errorf("package %s delivers its code as an OCI image and has no downloadable archive; pull %q with your registry tooling instead", opts.name, archive.OCI.Image)
+	}
+
+	if reader == nil {
+		return fmt.Errorf("package %s has no archive content to download", opts.name)
 	}
 
 	if len(opts.output) > 0 {

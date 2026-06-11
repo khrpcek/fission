@@ -1,18 +1,6 @@
-/*
-Copyright 2019 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package _package
 
@@ -24,6 +12,7 @@ import (
 	"errors"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/fission-cli/cliwrapper/cli"
@@ -56,7 +45,7 @@ func (opts *UpdateSubCommand) complete(input cli.Input) (err error) {
 	opts.pkgName = input.String(flagkey.PkgName)
 	_, opts.pkgNamespace, err = opts.GetResourceNamespace(input, flagkey.NamespacePackage)
 	if err != nil {
-		return fv1.AggregateValidationErrors("Environment", err)
+		return fv1.AggregateValidationErrors("Package", err)
 	}
 	opts.force = input.Bool(flagkey.PkgForce)
 	return nil
@@ -108,6 +97,20 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 	noZip := false
 	needToRebuild := false
 	needToUpdate := false
+
+	ociImage := input.String(flagkey.PkgOCI)
+	if input.IsSet(flagkey.PkgOCI) {
+		if input.IsSet(flagkey.PkgCode) || input.IsSet(flagkey.PkgSrcArchive) || input.IsSet(flagkey.PkgDeployArchive) {
+			return nil, fmt.Errorf("--%v cannot be combined with --%v, --%v, or --%v", flagkey.PkgOCI, flagkey.PkgCode, flagkey.PkgSrcArchive, flagkey.PkgDeployArchive)
+		}
+		// Replace the deployment archive wholesale: an OCI archive carries no
+		// literal, URL, or checksum (RFC-0001).
+		pkg.Spec.Deployment = fv1.Archive{
+			Type: fv1.ArchiveTypeOCI,
+			OCI:  &fv1.OCIArchive{Image: ociImage},
+		}
+		needToUpdate = true
+	}
 
 	if input.IsSet(flagkey.PkgCode) {
 		deployArchiveFiles = append(deployArchiveFiles, code)
@@ -195,14 +198,72 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 		return &pkg.ObjectMeta, nil
 	}
 
-	newPkgMeta, err := client.FissionClientSet.CoreV1().Packages(pkg.ObjectMeta.Namespace).Update(input.Context(), pkg, metav1.UpdateOptions{})
-	if err != nil {
+	packages := client.FissionClientSet.CoreV1().Packages(pkg.Namespace)
+
+	// Apply the desired spec, re-getting on conflict: the buildermgr writes a
+	// package's initial build status shortly after create, which bumps the
+	// ResourceVersion between our Get and this Update.
+	desiredSpec := pkg.Spec
+	var newPkg *fv1.Package
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh, gerr := packages.Get(input.Context(), pkg.Name, metav1.GetOptions{})
+		if gerr != nil {
+			return gerr
+		}
+		fresh.Spec = desiredSpec
+		var uerr error
+		newPkg, uerr = packages.Update(input.Context(), fresh, metav1.UpdateOptions{})
+		return uerr
+	}); err != nil {
 		return nil, fmt.Errorf("update package: %w", err)
 	}
 
-	fmt.Printf("Package '%v' updated\n", newPkgMeta.GetName())
+	// A package switched to an OCI deployment archive needs no build, but a
+	// stale build status from its previous life (a failed source build, say)
+	// would make the fetcher refuse to serve it. Reset it through the
+	// /status subresource — the spec Update above cannot touch status.
+	if newPkg.Spec.Deployment.OCI != nil {
+		switch newPkg.Status.BuildStatus {
+		case fv1.BuildStatusFailed, fv1.BuildStatusPending, fv1.BuildStatusRunning:
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				fresh, gerr := packages.Get(input.Context(), pkg.Name, metav1.GetOptions{})
+				if gerr != nil {
+					return gerr
+				}
+				fresh.Status.BuildStatus = fv1.BuildStatusNone
+				fresh.Status.BuildLog = ""
+				fresh.Status.LastUpdateTimestamp = metav1.Time{Time: time.Now().UTC()}
+				var uerr error
+				newPkg, uerr = packages.UpdateStatus(input.Context(), fresh, metav1.UpdateOptions{})
+				return uerr
+			}); err != nil {
+				return nil, fmt.Errorf("reset package build status for oci archive: %w", err)
+			}
+		}
+	}
 
-	return &newPkgMeta.ObjectMeta, err
+	// The rebuild trigger (BuildStatusPending) is a status write; with the
+	// /status subresource the spec Update above ignores it, so persist it
+	// separately through UpdateStatus (also conflict-retried).
+	if needToRebuild {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh, gerr := packages.Get(input.Context(), pkg.Name, metav1.GetOptions{})
+			if gerr != nil {
+				return gerr
+			}
+			fresh.Status.BuildStatus = fv1.BuildStatusPending
+			fresh.Status.LastUpdateTimestamp = metav1.Time{Time: time.Now().UTC()}
+			var uerr error
+			newPkg, uerr = packages.UpdateStatus(input.Context(), fresh, metav1.UpdateOptions{})
+			return uerr
+		}); err != nil {
+			return nil, fmt.Errorf("update package status: %w", err)
+		}
+	}
+
+	fmt.Printf("Package '%v' updated\n", newPkg.GetName())
+
+	return &newPkg.ObjectMeta, nil
 }
 
 func UpdateFunctionPackageResourceVersion(ctx context.Context, client cmd.Client, pkgMeta *metav1.ObjectMeta, fnList ...fv1.Function) error {
@@ -222,13 +283,25 @@ func UpdateFunctionPackageResourceVersion(ctx context.Context, client cmd.Client
 
 func updatePackageStatus(ctx context.Context, client cmd.Client, pkg *fv1.Package, status fv1.BuildStatus) (*metav1.ObjectMeta, error) {
 	switch status {
-	case fv1.BuildStatusNone, fv1.BuildStatusPending, fv1.BuildStatusRunning, fv1.BuildStatusSucceeded, fv1.CanaryConfigStatusAborted:
-		pkg.Status = fv1.PackageStatus{
-			BuildStatus:         status,
-			LastUpdateTimestamp: metav1.Time{Time: time.Now().UTC()},
+	case fv1.BuildStatusNone, fv1.BuildStatusPending, fv1.BuildStatusRunning, fv1.BuildStatusSucceeded, fv1.BuildStatusFailed:
+		packages := client.FissionClientSet.CoreV1().Packages(pkg.Namespace)
+		var out *fv1.Package
+		// Re-get on conflict: the buildermgr can update the package status
+		// concurrently.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh, gerr := packages.Get(ctx, pkg.Name, metav1.GetOptions{})
+			if gerr != nil {
+				return gerr
+			}
+			fresh.Status.BuildStatus = status
+			fresh.Status.LastUpdateTimestamp = metav1.Time{Time: time.Now().UTC()}
+			var uerr error
+			out, uerr = packages.UpdateStatus(ctx, fresh, metav1.UpdateOptions{})
+			return uerr
+		}); err != nil {
+			return nil, err
 		}
-		pkg, err := client.FissionClientSet.CoreV1().Packages(pkg.Namespace).Update(ctx, pkg, metav1.UpdateOptions{})
-		return &pkg.ObjectMeta, err
+		return &out.ObjectMeta, nil
 	}
 	return nil, errors.New("unknown package status")
 }

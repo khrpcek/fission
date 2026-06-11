@@ -1,30 +1,31 @@
-/*
-Copyright 2018 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package v1
 
 import (
 	asv2 "k8s.io/api/autoscaling/v2"
 	apiv1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
 	DefaultConcurrency    = 500
 	DefaultRequestsPerPod = 1
+)
+
+// RouteProviderType selects how the router exposes an HTTPTrigger externally.
+// It is the type of RouteConfig.Provider; the allowed values are the constants
+// below (also enforced by the field's kubebuilder Enum marker).
+type RouteProviderType string
+
+const (
+	// RouteProviderIngress creates a networking.k8s.io Ingress (deprecated).
+	RouteProviderIngress RouteProviderType = "ingress"
+	// RouteProviderGateway creates a gateway.networking.k8s.io HTTPRoute.
+	RouteProviderGateway RouteProviderType = "gateway"
 )
 
 //
@@ -46,6 +47,7 @@ type (
 	// Package Think of these as function-level images.
 	// +genclient
 	// +kubebuilder:object:root=true
+	// +kubebuilder:subresource:status
 	// +kubebuilder:resource:singular="package",scope="Namespaced",shortName={pkg}
 	Package struct {
 		metav1.TypeMeta   `json:",inline"`
@@ -193,6 +195,7 @@ type (
 	// CanaryConfig is for canary deployment of two functions.
 	// +genclient
 	// +kubebuilder:object:root=true
+	// +kubebuilder:subresource:status
 	CanaryConfig struct {
 		metav1.TypeMeta   `json:",inline"`
 		metav1.ObjectMeta `json:"metadata"`
@@ -227,19 +230,27 @@ type (
 		Sum  string       `json:"sum,omitempty"`
 	}
 
-	// ArchiveType is either literal or URL, indicating whether
-	// the package is specified in the Archive struct or
-	// externally.
+	// ArchiveType is literal, url, or oci, indicating whether the
+	// package is specified in the Archive struct or externally.
 	ArchiveType string
 
 	// Archive contains or references a collection of sources or
 	// binary files.
+	// The CEL rule below deliberately never references self.literal: any
+	// access to a byte-format field (even has()) makes the apiserver convert
+	// its base64 value for CEL using URL-safe decoding, which rejects any
+	// standard-base64 payload containing '/' or '+' — in practice every
+	// zipped literal archive. The literal/oci combination is instead
+	// rejected by the webhook (Archive.Validate), with the same message.
+	// +kubebuilder:validation:XValidation:rule="!has(self.oci) || !has(self.url) || self.url == ''",message="at most one of literal, url, or oci may be set"
 	Archive struct {
-		// Type defines how the package is specified: literal or URL.
+		// Type defines how the package is specified: literal, URL, or OCI.
 		// Available value:
 		//  - literal
 		//  - url
+		//  - oci
 		// +optional
+		// +kubebuilder:validation:Enum="";literal;url;oci
 		Type ArchiveType `json:"type,omitempty"`
 
 		// Literal contents of the package. Can be used for
@@ -254,25 +265,78 @@ type (
 		// Checksum ensures the integrity of packages
 		// referenced by URL. Ignored for literals.
 		// +optional
+		// +kubebuilder:validation:XValidation:rule="((!has(self.type) || self.type == '') && (!has(self.sum) || self.sum == '')) || self.type == 'sha256'",message="checksum must be empty, or its type must be 'sha256' (the only supported checksum type)"
 		Checksum Checksum `json:"checksum,omitempty"`
+
+		// OCI references an OCI image holding the deployment code.
+		// Mutually exclusive with Literal and URL. Supported only on
+		// PackageSpec.Deployment; PackageSpec.Validate rejects it on Source
+		// (source archives feed the builder, which has no OCI pull path).
+		// +optional
+		OCI *OCIArchive `json:"oci,omitempty"`
 	}
 
-	// EnvironmentReference is a reference to an environment.
+	// OCIArchive references an OCI image whose flattened filesystem
+	// contains the deployment code (RFC-0001). The environment runtime
+	// image stays the pod's main container; only how the code reaches
+	// the shared volume changes.
+	OCIArchive struct {
+		// Image is a fully qualified OCI reference: registry/repo:tag[@digest].
+		// +kubebuilder:validation:MinLength=1
+		Image string `json:"image"`
+
+		// ImagePullSecrets are resolved when pulling the image. The
+		// fetcher-pull path passes them to the in-fetcher keychain; the
+		// image-volume path sets them on pod.Spec.ImagePullSecrets.
+		// They must exist in the namespace the function pods run in —
+		// the function's own namespace, or the configured function
+		// namespace for default-namespace functions.
+		// +optional
+		ImagePullSecrets []apiv1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+
+		// SubPath points at the deployment root inside the image
+		// filesystem, as a clean relative path; empty means the image
+		// root. It must be a directory: the image-volume path mounts it
+		// via the pod volumeMount subPath, and kubelets reject file
+		// subpaths on image volumes.
+		// +optional
+		SubPath string `json:"subPath,omitempty"`
+
+		// Digest is an optional content hash validated on pull.
+		// +optional
+		// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
+		Digest string `json:"digest,omitempty"`
+	}
+
+	// EnvironmentReference is a reference to an environment. It is used by both
+	// FunctionSpec.Environment and PackageSpec.Environment.
 	EnvironmentReference struct {
 		Namespace string `json:"namespace"`
-		Name      string `json:"name"`
+		// Name of the referenced environment. Optional + omitempty: an unset
+		// reference is omitted and its Pattern skipped (a container function has
+		// no environment; a Package with an unset environment is admitted and
+		// fails later with a clear builder error — the fission CLI still rejects
+		// it). When set, it must be a DNS-1123 label.
+		// +optional
+		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+		// +kubebuilder:validation:MaxLength=63
+		Name string `json:"name,omitempty"`
 	}
 
 	// SecretReference is a reference to a kubernetes secret.
 	SecretReference struct {
 		Namespace string `json:"namespace"`
-		Name      string `json:"name"`
+		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+		// +kubebuilder:validation:MaxLength=63
+		Name string `json:"name"`
 	}
 
 	// ConfigMapReference is a reference to a kubernetes configmap.
 	ConfigMapReference struct {
 		Namespace string `json:"namespace"`
-		Name      string `json:"name"`
+		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+		// +kubebuilder:validation:MaxLength=63
+		Name string `json:"name"`
 	}
 
 	// BuildStatus indicates the current build status of a package.
@@ -307,6 +371,7 @@ type (
 
 		// BuildStatus is the package build status.
 		// +kubebuilder:default:="pending"
+		// +kubebuilder:validation:Enum="";pending;running;succeeded;failed;none
 		BuildStatus BuildStatus `json:"buildstatus,omitempty"`
 
 		// BuildLog stores build log during the compilation.
@@ -333,8 +398,15 @@ type (
 	PackageRef struct {
 		// +optional
 		Namespace string `json:"namespace"`
+		// The package reference is optional, so Name is omitempty: when unset it
+		// is omitted from the object and the Pattern below is skipped (a function
+		// may legitimately have no package). A present name must be a DNS-1123
+		// label. A leaf Pattern (cheap structural validation) is used rather than
+		// a spec-level CEL matches() (which would exceed the cost budget).
 		// +optional
-		Name string `json:"name"`
+		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+		// +kubebuilder:validation:MaxLength=63
+		Name string `json:"name,omitempty"`
 
 		// Including resource version in the reference forces the function to be updated on
 		// package update, making it possible to cache the function based on its metadata.
@@ -365,6 +437,25 @@ type (
 	StrategyType string
 
 	// FunctionSpec describes the contents of the function.
+	// +kubebuilder:validation:XValidation:rule="!(has(self.InvokeStrategy.ExecutionStrategy) && self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'container') || has(self.podspec)",message="executor type container requires a pod spec (spec.podspec)"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.InvokeStrategy.ExecutionStrategy) && (self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'newdeploy' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'container')) || !has(self.InvokeStrategy.ExecutionStrategy.MinScale) || self.InvokeStrategy.ExecutionStrategy.MinScale >= 0",message="minimum scale must be greater than or equal to 0 for newdeploy/container executors"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.InvokeStrategy.ExecutionStrategy) && (self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'newdeploy' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'container')) || (has(self.InvokeStrategy.ExecutionStrategy.MaxScale) && self.InvokeStrategy.ExecutionStrategy.MaxScale > 0)",message="maximum scale must be greater than 0 for newdeploy/container executors"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.InvokeStrategy.ExecutionStrategy) && (self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'newdeploy' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'container')) || !has(self.InvokeStrategy.ExecutionStrategy.MaxScale) || self.InvokeStrategy.ExecutionStrategy.MaxScale >= (has(self.InvokeStrategy.ExecutionStrategy.MinScale) ? self.InvokeStrategy.ExecutionStrategy.MinScale : 0)",message="maximum scale must be greater than or equal to minimum scale for newdeploy/container executors"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.InvokeStrategy.ExecutionStrategy) && (self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'newdeploy' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'container')) || !has(self.InvokeStrategy.ExecutionStrategy.TargetCPUPercent) || (self.InvokeStrategy.ExecutionStrategy.TargetCPUPercent >= 0 && self.InvokeStrategy.ExecutionStrategy.TargetCPUPercent <= 100)",message="TargetCPUPercent must be a value between 0 and 100 for newdeploy/container executors"
+	// +kubebuilder:validation:XValidation:rule="!has(self.InvokeStrategy.StrategyType) || self.InvokeStrategy.StrategyType == '' || self.InvokeStrategy.StrategyType == 'execution'",message="InvokeStrategy.StrategyType must be 'execution'"
+	// +kubebuilder:validation:XValidation:rule="!has(self.InvokeStrategy.ExecutionStrategy) || !has(self.InvokeStrategy.ExecutionStrategy.ExecutorType) || self.InvokeStrategy.ExecutionStrategy.ExecutorType == '' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'poolmgr' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'newdeploy' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'container'",message="ExecutionStrategy.ExecutorType must be one of poolmgr, newdeploy, container"
+	// Bounded podspec safety rules — CEL admission gate for the simple pod-level
+	// invariants. Per-container SecurityContext checks stay in the webhook
+	// (ValidatePodSpecSafety) because iterating containers exceeds the CEL cost
+	// budget; the rules here cover only the bounded, cheap cases. The has()
+	// guards on each scalar are required: PodSpec's bool/string fields are
+	// json:"...,omitempty" so a zero/empty value is OMITTED from the object,
+	// and CEL errors with "no such key" if the rule accesses an absent field.
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostNetwork) || !self.podspec.hostNetwork",message="spec.podspec.hostNetwork is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostPID) || !self.podspec.hostPID",message="spec.podspec.hostPID is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostIPC) || !self.podspec.hostIPC",message="spec.podspec.hostIPC is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccountName) || self.podspec.serviceAccountName == ''",message="spec.podspec.serviceAccountName override is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccount) || self.podspec.serviceAccount == ''",message="spec.podspec.serviceAccount override is not allowed"
 	FunctionSpec struct {
 		// Environment is the build and runtime environment that this function is
 		// associated with. An Environment with this name should exist, otherwise the
@@ -410,6 +501,22 @@ type (
 		// +optional
 		IdleTimeout *int `json:"idletimeout,omitempty"`
 
+		// Streaming opts this function into the router's streaming invocation path:
+		// incremental flushing, an idle/max timeout split, and a router-driven pod
+		// keepalive for the connection's lifetime. When nil (the default) the function
+		// uses the classic buffered, retry-on-transient-error proxy path with a single
+		// FunctionTimeout deadline. Additive and backward compatible.
+		// +optional
+		Streaming *StreamingConfig `json:"streaming,omitempty"`
+
+		// Tool, when non-nil, advertises this function as a Model Context Protocol
+		// (MCP) tool on the fission-bundle --mcpPort server. The MCP server watches
+		// Function CRDs and hot-updates its tool list from this field. Presence is
+		// the on switch (like Streaming): nil (the default) means the function is
+		// never advertised as a tool. Additive and backward compatible.
+		// +optional
+		Tool *ToolConfig `json:"tool,omitempty"`
+
 		// Maximum number of pods to be specialized which will serve requests
 		// This is optional. If not specified default value will be taken as 500
 		// +optional
@@ -434,6 +541,63 @@ type (
 		// Different arguments mentioned for container based function are populated inside a pod.
 		// +optional
 		PodSpec *apiv1.PodSpec `json:"podspec,omitempty"`
+	}
+
+	// StreamingProtocol selects how the router treats the upstream response.
+	// +kubebuilder:validation:Enum=auto;sse;chunked;websocket
+	StreamingProtocol string
+
+	// StreamingConfig controls the router's streaming behavior for a function.
+	// Presence is the on switch: a non-nil Streaming enables the streaming path,
+	// nil (the default) is the classic buffered path. There is no separate enabled
+	// flag, so the in-memory zero value and the stored object never disagree.
+	StreamingConfig struct {
+		// Protocol hints how the router proxies the response.
+		// +optional
+		// +kubebuilder:default=auto
+		Protocol StreamingProtocol `json:"protocol,omitempty"`
+
+		// IdleTimeoutSeconds is the maximum time the router waits without bytes flowing
+		// from the function before it aborts the stream; reset on every chunk. 0 means
+		// use the package default (DefaultStreamIdleSeconds).
+		// +optional
+		// +kubebuilder:validation:Minimum=0
+		IdleTimeoutSeconds int `json:"idleTimeoutSeconds,omitempty"`
+
+		// MaxDurationSeconds is an optional hard ceiling on total stream lifetime
+		// regardless of activity. 0 (the default) means no ceiling — the idle
+		// timeout governs. A streaming function does NOT inherit FunctionTimeout as
+		// a ceiling; that total-wall-clock cap is exactly what streaming escapes.
+		// +optional
+		// +kubebuilder:validation:Minimum=0
+		MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
+	}
+
+	// ToolConfig declares how a Function is exposed as an MCP (Model Context
+	// Protocol) tool. The MCP server reuses the function's existing internal
+	// invocation path; this struct only declares the agent-facing tool contract.
+	// Presence of the enclosing FunctionSpec.Tool is the on switch — there is no
+	// separate enabled flag, so the in-memory zero value and the stored object
+	// never disagree (the same rationale as StreamingConfig).
+	ToolConfig struct {
+		// Description is the human/agent-facing tool description surfaced in the MCP
+		// tools/list response. Required.
+		// +optional
+		Description string `json:"description,omitempty"`
+
+		// InputSchema is the JSON Schema (draft 2020-12) for the tool's arguments,
+		// surfaced verbatim as the MCP tool inputSchema. Stored as raw JSON so the
+		// CRD does not constrain the schema shape. When empty the tool advertises an
+		// open object schema ({"type":"object"}).
+		// +optional
+		// +kubebuilder:pruning:PreserveUnknownFields
+		InputSchema *apiextensionsv1.JSON `json:"inputSchema,omitempty"`
+
+		// ToolName overrides the advertised tool name. Defaults to
+		// "<namespace>-<function name>". Must match ^[a-zA-Z0-9_-]{1,64}$.
+		// +optional
+		// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_-]{1,64}$`
+		ToolName string `json:"toolName,omitempty"`
 	}
 
 	// InvokeStrategy is a set of controls over how the function executes.
@@ -513,6 +677,7 @@ type (
 	FunctionReferenceType string
 
 	// FunctionReference refers to a function
+	// +kubebuilder:validation:XValidation:rule="self.type != 'name' || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))",message="functionref.name must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars) when type is 'name'"
 	FunctionReference struct {
 		// Type indicates whether this function reference is by name or selector. For now,
 		// the only supported reference type is by "name".  Future reference types:
@@ -522,6 +687,7 @@ type (
 		// Available value:
 		// - name
 		// - function-weights
+		// +kubebuilder:validation:Enum=name;function-weights
 		Type FunctionReferenceType `json:"type"`
 
 		// Name of the function.
@@ -539,6 +705,19 @@ type (
 	//
 
 	// Runtime is the setting for environment runtime.
+	// Bounded podspec / container safety rules — CEL admission gate for the
+	// simple, bounded fields. Per-container PodSpec.containers iteration stays
+	// in the webhook (ValidatePodSpecSafety / ValidateContainerSafety) because
+	// it exceeds the CEL cost budget. The has() guards are required because
+	// json:"...,omitempty" omits zero/empty values from the object.
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostNetwork) || !self.podspec.hostNetwork",message="spec.runtime.podspec.hostNetwork is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostPID) || !self.podspec.hostPID",message="spec.runtime.podspec.hostPID is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostIPC) || !self.podspec.hostIPC",message="spec.runtime.podspec.hostIPC is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccountName) || self.podspec.serviceAccountName == ''",message="spec.runtime.podspec.serviceAccountName override is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccount) || self.podspec.serviceAccount == ''",message="spec.runtime.podspec.serviceAccount override is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.container) || !has(self.container.securityContext) || !has(self.container.securityContext.privileged) || !self.container.securityContext.privileged",message="spec.runtime.container.securityContext.privileged=true is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.container) || !has(self.container.securityContext) || !has(self.container.securityContext.allowPrivilegeEscalation) || !self.container.securityContext.allowPrivilegeEscalation",message="spec.runtime.container.securityContext.allowPrivilegeEscalation=true is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.container) || !has(self.container.securityContext) || !has(self.container.securityContext.capabilities) || !has(self.container.securityContext.capabilities.add) || self.container.securityContext.capabilities.add.all(c, c == 'NET_BIND_SERVICE')",message="spec.runtime.container.securityContext.capabilities.add may only contain NET_BIND_SERVICE (PSA restricted)"
 	Runtime struct {
 		// Image for containing the language runtime.
 		Image string `json:"image"`
@@ -586,6 +765,15 @@ type (
 	}
 
 	// Builder is the setting for environment builder.
+	// Bounded podspec / container safety rules — see the matching Runtime block above.
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostNetwork) || !self.podspec.hostNetwork",message="spec.builder.podspec.hostNetwork is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostPID) || !self.podspec.hostPID",message="spec.builder.podspec.hostPID is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostIPC) || !self.podspec.hostIPC",message="spec.builder.podspec.hostIPC is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccountName) || self.podspec.serviceAccountName == ''",message="spec.builder.podspec.serviceAccountName override is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccount) || self.podspec.serviceAccount == ''",message="spec.builder.podspec.serviceAccount override is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.container) || !has(self.container.securityContext) || !has(self.container.securityContext.privileged) || !self.container.securityContext.privileged",message="spec.builder.container.securityContext.privileged=true is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.container) || !has(self.container.securityContext) || !has(self.container.securityContext.allowPrivilegeEscalation) || !self.container.securityContext.allowPrivilegeEscalation",message="spec.builder.container.securityContext.allowPrivilegeEscalation=true is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.container) || !has(self.container.securityContext) || !has(self.container.securityContext.capabilities) || !has(self.container.securityContext.capabilities.add) || self.container.securityContext.capabilities.add.all(c, c == 'NET_BIND_SERVICE')",message="spec.builder.container.securityContext.capabilities.add may only contain NET_BIND_SERVICE (PSA restricted)"
 	Builder struct {
 		// Image for containing the language compilation environment.
 		Image string `json:"image,omitempty"`
@@ -618,6 +806,9 @@ type (
 		// Version "2" supports downloading and compiling user function if source archive is not empty.
 		//
 		// Version "3" is almost the same with v2, but you're able to control the size of pre-warm pool of the environment.
+		// +kubebuilder:validation:Minimum=1
+		// +kubebuilder:validation:Maximum=3
+		// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.version is immutable"
 		Version int `json:"version"`
 
 		// Runtime is configuration for running function, like container image etc.
@@ -639,6 +830,7 @@ type (
 		// - single
 		// - infinite
 		// +optional
+		// +kubebuilder:validation:Enum=single;infinite
 		AllowedFunctionsPerContainer AllowedFunctionsPerContainer `json:"allowedFunctionsPerContainer,omitempty"`
 
 		// Istio default blocks all egress traffic for safety.
@@ -654,11 +846,13 @@ type (
 
 		// The initial pool size for environment
 		// +optional
+		// +kubebuilder:validation:Minimum=0
 		Poolsize int `json:"poolsize,omitempty"`
 
 		// The grace time for pod to perform connection draining before termination. The unit is in seconds.
 		// (Optional) defaults to 360 seconds
 		// +optional
+		// +kubebuilder:validation:Minimum=0
 		TerminationGracePeriod int64 `json:"terminationGracePeriod,omitempty"`
 
 		// KeepArchive is used by fetcher to determine if the extracted archive
@@ -680,11 +874,15 @@ type (
 	//
 
 	// HTTPTriggerSpec is for router to expose user functions at the given URL path.
+	// +kubebuilder:validation:XValidation:rule="self.relativeurl != '' || (has(self.prefix) && self.prefix != '')",message="HTTPTriggerSpec: at least one of relativeurl or prefix must be set"
+	// +kubebuilder:validation:XValidation:rule="self.relativeurl == '' || (self.relativeurl.startsWith('/') && self.relativeurl != '/' && !self.relativeurl.matches('(^|/)[.][.](/|$)') && !(self.relativeurl in ['/router-healthz','/readyz','/_version','/auth/login']) && !self.relativeurl.startsWith('/fission-function/'))",message="HTTPTriggerSpec.relativeurl must start with '/', not be '/', not contain '..' path segments, not collide with a router-owned path (/router-healthz, /readyz, /_version, /auth/login), and not start with /fission-function/"
+	// +kubebuilder:validation:XValidation:rule="!has(self.prefix) || self.prefix == '' || (self.prefix.startsWith('/') && self.prefix != '/' && !self.prefix.matches('(^|/)[.][.](/|$)') && !(self.prefix in ['/router-healthz','/readyz','/_version','/auth/login']) && !self.prefix.startsWith('/fission-function/'))",message="HTTPTriggerSpec.prefix must start with '/', not be '/', not contain '..' path segments, not collide with a router-owned path (/router-healthz, /readyz, /_version, /auth/login), and not start with /fission-function/"
 	HTTPTriggerSpec struct {
 		// TODO: remove this field since we have IngressConfig already
 		// Deprecated: the original idea of this field is not for setting Ingress.
 		// Since we have IngressConfig now, remove Host after couple releases.
 		// +optional
+		// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)?$`
 		Host string `json:"host"`
 
 		// RelativeURL is the exposed URL for external client to access a function with.
@@ -706,24 +904,39 @@ type (
 		// Use Methods instead of Method. This field is going to be deprecated in a future release
 		// HTTP method to access a function.
 		// +optional
+		// +kubebuilder:validation:Enum="";GET;HEAD;POST;PUT;PATCH;DELETE;CONNECT;OPTIONS;TRACE
 		Method string `json:"method"`
 
 		// HTTP methods to access a function
 		// +optional
 		// +listType=set
+		// +kubebuilder:validation:items:Enum=GET;HEAD;POST;PUT;PATCH;DELETE;CONNECT;OPTIONS;TRACE
 		Methods []string `json:"methods,omitempty"`
 
 		// FunctionReference is a reference to the target function.
 		FunctionReference FunctionReference `json:"functionref"`
 
 		// If CreateIngress is true, router will create an ingress definition.
+		// Deprecated: the Kubernetes Ingress API is frozen. Use RouteConfig
+		// (with Provider "gateway") to expose functions through the Gateway API
+		// instead. CreateIngress + IngressConfig keep working for the
+		// deprecation window but will be removed in a future release.
 		// +optional
 		CreateIngress bool `json:"createingress"`
 
 		// TODO: make IngressConfig an independent Fission resource
 		// IngressConfig for router to set up Ingress.
+		// Deprecated: superseded by RouteConfig. See CreateIngress.
 		// +optional
 		IngressConfig IngressConfig `json:"ingressconfig"`
+
+		// RouteConfig declares how the router exposes this trigger through an
+		// external route provider (Ingress or the Gateway API). It is the
+		// provider-neutral successor to CreateIngress + IngressConfig: when set
+		// it takes precedence over those fields. Leave nil to expose the
+		// function only through the router's own URL.
+		// +optional
+		RouteConfig *RouteConfig `json:"routeConfig,omitempty"`
 
 		// CorsConfig configures CORS response headers for browser
 		// callers of this trigger. When nil, the router emits no
@@ -741,6 +954,7 @@ type (
 	// middleware to the trigger's route. Triggers without a CorsConfig
 	// receive no Access-Control-* response headers and therefore deny
 	// cross-origin browser reads at the Same-Origin Policy layer.
+	// +kubebuilder:validation:XValidation:rule="!(has(self.allowCredentials) && self.allowCredentials && has(self.allowOrigins) && '*' in self.allowOrigins)",message="corsConfig.allowOrigins=[\"*\"] cannot be combined with allowCredentials=true; browsers refuse the response"
 	HTTPTriggerCorsConfig struct {
 		// AllowOrigins is the list of allowed origins (scheme + host +
 		// port). Use ["*"] to allow any origin. Mixing "*" with
@@ -782,6 +996,10 @@ type (
 	}
 
 	// IngressConfig is for router to set up Ingress.
+	// Deprecated: superseded by RouteConfig. The Kubernetes Ingress API is
+	// frozen; use RouteConfig with Provider "gateway" for new triggers.
+	// +kubebuilder:validation:XValidation:rule="!has(self.path) || self.path == '' || self.path.startsWith('/')",message="ingressconfig.path must be an absolute path (start with '/')"
+	// +kubebuilder:validation:XValidation:rule="!has(self.host) || self.host == '' || self.host == '*' || self.host.matches(r'^(\\*\\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')",message="ingressconfig.host must be empty, '*', a valid DNS1123 subdomain, or a wildcard DNS1123 subdomain (e.g. *.example.com)"
 	IngressConfig struct {
 		// Annotations will be added to metadata when creating Ingress.
 		// +optional
@@ -811,11 +1029,97 @@ type (
 		IngressClassName *string `json:"ingressClassName,omitempty"`
 	}
 
+	// RouteConfig declares how the router exposes an HTTPTrigger through an
+	// external route provider. It is the provider-neutral successor to the
+	// deprecated CreateIngress + IngressConfig fields: the router routes it to
+	// the matching RouteProvider based on Provider.
+	// +kubebuilder:validation:XValidation:rule="!has(self.path) || self.path == '' || self.path.startsWith('/')",message="routeConfig.path must be an absolute path (start with '/')"
+	// +kubebuilder:validation:XValidation:rule="self.provider != 'gateway' || (has(self.gateway) && size(self.gateway.parentRefs) > 0)",message="routeConfig.gateway.parentRefs must list at least one Gateway when provider is 'gateway' (unless the router is configured with a default Gateway)"
+	// +kubebuilder:validation:XValidation:rule="self.provider != 'gateway' || !has(self.tls) || self.tls == ''",message="routeConfig.tls applies to the ingress provider only; gateway TLS is configured on the Gateway listener"
+	RouteConfig struct {
+		// Provider selects the route provider that reconciles this trigger's
+		// external route. "ingress" creates a networking.k8s.io Ingress (the
+		// deprecated path); "gateway" creates a gateway.networking.k8s.io
+		// HTTPRoute attached to an operator-managed Gateway. The "gateway"
+		// provider must be enabled on the router (GATEWAY_API_ENABLED).
+		// +kubebuilder:validation:Enum=ingress;gateway
+		Provider RouteProviderType `json:"provider"`
+
+		// Hostnames the route matches. For the gateway provider these become
+		// the HTTPRoute hostnames; for the ingress provider only the first is
+		// used as the Ingress rule host. Empty matches all hosts.
+		// +optional
+		// +listType=set
+		Hostnames []string `json:"hostnames,omitempty"`
+
+		// Path is the request path the route matches (must be absolute, start
+		// with '/'). Defaults to "/" when empty.
+		// +optional
+		Path string `json:"path,omitempty"`
+
+		// Annotations are added to the generated route object (Ingress or
+		// HTTPRoute). Use these for implementation-specific configuration
+		// understood by your Ingress controller or Gateway implementation.
+		// +optional
+		// +nullable
+		Annotations map[string]string `json:"annotations,omitempty"`
+
+		// TLS names a Secret holding the TLS key and certificate. It applies to
+		// the ingress provider only; with the gateway provider TLS termination
+		// is configured on the Gateway listener and this field is ignored.
+		// +optional
+		TLS string `json:"tls,omitempty"`
+
+		// Gateway holds Gateway-API-specific configuration. Required (at least
+		// one parentRef) when Provider is "gateway", unless the router is
+		// configured with a default Gateway parentRef.
+		// +optional
+		Gateway *GatewayRouteConfig `json:"gateway,omitempty"`
+	}
+
+	// GatewayRouteConfig is the Gateway-API-specific portion of a RouteConfig.
+	GatewayRouteConfig struct {
+		// ParentRefs are the Gateways the generated HTTPRoute attaches to. The
+		// referenced Gateways are owned by the cluster operator (Fission does
+		// not create Gateways or GatewayClasses). A cross-namespace parentRef
+		// requires a ReferenceGrant in the Gateway's namespace.
+		// +optional
+		// +listType=atomic
+		ParentRefs []GatewayParentRef `json:"parentRefs,omitempty"`
+	}
+
+	// GatewayParentRef references a Gateway (and optionally a specific listener)
+	// that the generated HTTPRoute attaches to. It mirrors the subset of
+	// gateway.networking.k8s.io ParentReference that Fission needs.
+	GatewayParentRef struct {
+		// Name of the parent Gateway.
+		Name string `json:"name"`
+
+		// Namespace of the parent Gateway. Defaults to the router's namespace
+		// when empty. A non-empty, different namespace needs a ReferenceGrant.
+		// +optional
+		Namespace string `json:"namespace,omitempty"`
+
+		// SectionName selects a specific listener on the Gateway. Empty attaches
+		// to all compatible listeners.
+		// +optional
+		SectionName string `json:"sectionName,omitempty"`
+
+		// Port narrows attachment to a specific Gateway listener port.
+		// +optional
+		// +kubebuilder:validation:Minimum=1
+		// +kubebuilder:validation:Maximum=65535
+		Port int32 `json:"port,omitempty"`
+	}
+
 	// KubernetesWatchTriggerSpec defines spec of KuberenetesWatchTrigger
 	KubernetesWatchTriggerSpec struct {
+		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+		// +kubebuilder:validation:MaxLength=63
 		Namespace string `json:"namespace"`
 
 		// Type of resource to watch (Pod, Service, etc.)
+		// +kubebuilder:validation:XValidation:rule="self.upperAscii() in ['POD','SERVICE','REPLICATIONCONTROLLER','JOB']",message="spec.type must be one of POD, SERVICE, REPLICATIONCONTROLLER, JOB (case-insensitive)"
 		Type string `json:"type"`
 
 		// Resource labels
@@ -1059,7 +1363,7 @@ type (
 
 // IsEmpty checks if the archive byte and litreal are of length 0
 func (a Archive) IsEmpty() bool {
-	return len(a.Literal) == 0 && len(a.URL) == 0
+	return len(a.Literal) == 0 && len(a.URL) == 0 && a.OCI == nil
 }
 
 func (fn Function) GetConcurrency() int {
@@ -1078,4 +1382,14 @@ func (fn Function) GetRequestPerPod() int {
 		return DefaultRequestsPerPod
 	}
 	return fn.Spec.RequestsPerPod
+}
+
+// StrictConcurrencyEnforcement reports whether the function opted out of
+// router-local admission (RFC-0002) via the
+// fission.io/concurrency-enforcement: strict annotation: every request then
+// goes through the executor's PoolCache exactly as before the EndpointSlice
+// data plane, giving exact global per-pod concurrency accounting at the cost
+// of the warm-path RPCs.
+func (fn Function) StrictConcurrencyEnforcement() bool {
+	return fn.Annotations[ConcurrencyEnforcementAnnotation] == ConcurrencyEnforcementStrict
 }

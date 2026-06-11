@@ -1,28 +1,19 @@
-/*
-Copyright 2016 The Fission Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
 
 package reaper
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	apiv1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/go-logr/logr"
@@ -31,42 +22,61 @@ import (
 	"github.com/fission/fission/pkg/utils"
 )
 
+// CleanupExecutorObjects reaps the HorizontalPodAutoscaler, Deployment and
+// Service objects of the given executor type whose executorInstanceId annotation
+// no longer matches instanceID (orphans left by a previous executor instance).
+// It's the shared body of the newdeploy and container managers'
+// CleanupOldExecutorObjects; errors are logged and swallowed, matching the
+// best-effort reaping the callers previously did inline.
+func CleanupExecutorObjects(ctx context.Context, logger logr.Logger, client kubernetes.Interface, instanceID string, executorType fv1.ExecutorType) {
+	logger.Info("starting to clean orphaned executor resources", "executorType", executorType, "instanceID", instanceID)
+	listOpts := metav1.ListOptions{
+		LabelSelector: labels.Set{fv1.EXECUTOR_TYPE: string(executorType)}.AsSelector().String(),
+	}
+	errs := errors.Join(
+		CleanupHpa(ctx, logger, client, instanceID, listOpts),
+		CleanupDeployments(ctx, logger, client, instanceID, listOpts),
+		CleanupServices(ctx, logger, client, instanceID, listOpts),
+	)
+	if errs != nil {
+		// TODO retry reaper; logged and ignored for now
+		logger.Error(errs, "failed to cleanup old executor objects", "executorType", executorType)
+	}
+}
+
 var (
 	deletePropagation = metav1.DeletePropagationBackground
 	delOpt            = metav1.DeleteOptions{PropagationPolicy: &deletePropagation}
 )
 
-// CleanupKubeObject deletes given kubernetes object
+// CleanupKubeObject deletes given kubernetes object, logging (not returning)
+// any failure. Callers that need to retry use DeleteKubeObject directly.
 func CleanupKubeObject(ctx context.Context, logger logr.Logger, kubeClient kubernetes.Interface, kubeobj *apiv1.ObjectReference) {
+	if err := DeleteKubeObject(ctx, kubeClient, kubeobj); err != nil {
+		logger.Error(err, "error cleaning up kubernetes object", "type", kubeobj.Kind, "name", kubeobj.Name, "ns", kubeobj.Namespace)
+	}
+}
+
+// DeleteKubeObject deletes the given kubernetes object and reports the
+// outcome: nil on success or already-gone, the API error otherwise.
+func DeleteKubeObject(ctx context.Context, kubeClient kubernetes.Interface, kubeobj *apiv1.ObjectReference) error {
+	var err error
 	switch strings.ToLower(kubeobj.Kind) {
 	case "pod":
-		err := kubeClient.CoreV1().Pods(kubeobj.Namespace).Delete(ctx, kubeobj.Name, metav1.DeleteOptions{})
-		if err != nil && !k8serrors.IsNotFound(err) {
-			logger.Error(err, "error cleaning up pod", "pod", kubeobj.Name)
-		}
-
+		err = kubeClient.CoreV1().Pods(kubeobj.Namespace).Delete(ctx, kubeobj.Name, metav1.DeleteOptions{})
 	case "service":
-		err := kubeClient.CoreV1().Services(kubeobj.Namespace).Delete(ctx, kubeobj.Name, metav1.DeleteOptions{})
-		if err != nil && !k8serrors.IsNotFound(err) {
-			logger.Error(err, "error cleaning up service", "service", kubeobj.Name)
-		}
-
+		err = kubeClient.CoreV1().Services(kubeobj.Namespace).Delete(ctx, kubeobj.Name, metav1.DeleteOptions{})
 	case "deployment":
-		err := kubeClient.AppsV1().Deployments(kubeobj.Namespace).Delete(ctx, kubeobj.Name, delOpt)
-		if err != nil && !k8serrors.IsNotFound(err) {
-			logger.Error(err, "error cleaning up deployment", "deployment", kubeobj.Name)
-		}
-
+		err = kubeClient.AppsV1().Deployments(kubeobj.Namespace).Delete(ctx, kubeobj.Name, delOpt)
 	case "horizontalpodautoscaler":
-		err := kubeClient.AutoscalingV2().HorizontalPodAutoscalers(kubeobj.Namespace).Delete(ctx, kubeobj.Name, metav1.DeleteOptions{})
-		if err != nil && !k8serrors.IsNotFound(err) {
-			logger.Error(err, "error cleaning up horizontalpodautoscaler", "horizontalpodautoscaler", kubeobj.Name)
-		}
-
+		err = kubeClient.AutoscalingV2().HorizontalPodAutoscalers(kubeobj.Namespace).Delete(ctx, kubeobj.Name, metav1.DeleteOptions{})
 	default:
-		logger.Error(nil, "Could not identifying the object type to clean up", "type", kubeobj.Kind, "object", kubeobj)
-
+		return fmt.Errorf("could not identify the object type %q to clean up object %q", kubeobj.Kind, kubeobj.Name)
 	}
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 // CleanupDeployments deletes deployment(s) for a given instanceID
