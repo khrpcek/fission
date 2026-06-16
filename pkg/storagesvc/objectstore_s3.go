@@ -24,12 +24,12 @@ type s3ObjectStore struct {
 
 // newS3ObjectStore connects to the S3-compatible endpoint and ensures the
 // bucket exists.
-func newS3ObjectStore(endpoint, accessKeyID, secretAccessKey, region, bucket string) (*s3ObjectStore, error) {
+func newS3ObjectStore(endpoint string, secure bool, accessKeyID, secretAccessKey, region, bucket string) (*s3ObjectStore, error) {
 	client, err := minio.New(endpoint, &minio.Options{
 		Creds: credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
 		// Plain HTTP to the endpoint (the storagesvc S3 backend has always
 		// connected without TLS).
-		Secure: false,
+		Secure: secure,
 		Region: region,
 	})
 	if err != nil {

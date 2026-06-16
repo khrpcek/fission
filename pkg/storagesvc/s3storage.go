@@ -7,6 +7,7 @@ package storagesvc
 import (
 	"os"
 	"path"
+	"strconv"
 
 	"github.com/fission/fission/pkg/utils/uuid"
 )
@@ -20,6 +21,7 @@ type (
 		accessKeyID     string
 		secretAccessKey string
 		region          string
+		secure          bool
 	}
 )
 
@@ -31,6 +33,10 @@ func NewS3Storage(args ...string) Storage {
 	accessKeyID := os.Getenv("STORAGE_S3_ACCESS_KEY_ID")
 	secretAccessKey := os.Getenv("STORAGE_S3_SECRET_ACCESS_KEY")
 	region := os.Getenv("STORAGE_S3_REGION")
+	secure, err := strconv.ParseBool(os.Getenv("STORAGE_S3_SECURE"))
+	if err != nil {
+		secure = true
+	}
 
 	return s3Storage{
 		endpoint:        endpoint,
@@ -40,6 +46,7 @@ func NewS3Storage(args ...string) Storage {
 		accessKeyID:     accessKeyID,
 		secretAccessKey: secretAccessKey,
 		region:          region,
+		secure:          secure,
 	}
 }
 
@@ -61,5 +68,5 @@ func (ss s3Storage) getUploadFileName() (string, error) {
 }
 
 func (ss s3Storage) dial() (objectStore, error) {
-	return newS3ObjectStore(ss.endpoint, ss.accessKeyID, ss.secretAccessKey, ss.region, ss.bucketName)
+	return newS3ObjectStore(ss.endpoint, ss.secure, ss.accessKeyID, ss.secretAccessKey, ss.region, ss.bucketName)
 }
